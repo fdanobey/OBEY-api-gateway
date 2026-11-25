@@ -38,6 +38,13 @@ const EVENT_RETENTION_LIMIT: i64 = 500;
 /// of re-evaluation cycles; older anomaly rows prune normally.
 const ANOMALY_RETENTION_EXEMPTION_SECS: i64 = 30 * 24 * 60 * 60;
 
+/// Age bound of the `usage.anomaly` prune-tail exemption (Req 3.6),
+/// distinct from the performance-anomaly 30-day bound: per-key
+/// findings are higher-volume than fleet-level scopes, so the
+/// exemption is shorter — bounded worst case keys × 7 signals ×
+/// 7 days of exempt rows; older usage-anomaly rows prune normally.
+const USAGE_ANOMALY_RETENTION_EXEMPTION_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// TTL of the cached recent-events rows served to dashboard snapshots;
 /// mirror of `BUDGET_STORE_ROWS_TTL` in the metrics module.
 const RECENT_EVENTS_CACHE_TTL: Duration = Duration::from_secs(1);
@@ -492,10 +499,38 @@ result.map_err(WebhookLedgerError::Database)
             ORDER BY created_at DESC, rowid DESC
             LIMIT 1",
         )?;
-        let mut rows = stmt
-            .query_map(params![event_type], row_to_alert_event)?
+    let mut rows = stmt
+        .query_map(params![event_type], row_to_alert_event)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows.pop())
+    }
+
+    /// Recorded firing identities for per-finding dedup (Req 3.5):
+    /// the set of `(key_id, signal, evaluated_day)` tuples carried
+    /// by `event_type` rows whose payload `data.evaluated_day`
+    /// equals `day` — `usage.anomaly` rows store the identity in
+    /// the payload JSON (`data.key_id` + `data.signal` + the day),
+    /// mirroring how `performance.anomaly` rows carry their
+    /// `(scope, name, signal)` identity. The key id is the identity;
+    /// the display name is cosmetic and never part of the tuple.
+    /// Rows with malformed payloads or other days are skipped.
+    /// Result-returning like [`Self::events_of_type_since`]: a
+    /// failed read must fail the cycle instead of re-firing
+    /// already-recorded findings.
+    pub fn fetch_recorded_firings(
+        &self,
+        event_type: &str,
+        day: &str,
+    ) -> Result<std::collections::HashSet<(String, String, String)>, WebhookLedgerError> {
+        let conn = self.conn.lock().expect("webhooks.db mutex poisoned");
+        let mut stmt = conn.prepare("SELECT payload_json FROM alert_events WHERE type = ?1")?;
+        let payloads = stmt
+            .query_map(params![event_type], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows.pop())
+        Ok(payloads
+            .iter()
+            .filter_map(|payload_json| usage_anomaly_firing_of(payload_json, day))
+            .collect())
     }
 
     /// [`Self::recent_events`] with an optional SQL-level `webhook.test`
@@ -768,12 +803,14 @@ params![id, event_type, scope, scope_label, payload_json, created_at],
 )?;
     // Newest EVENT_RETENTION_LIMIT events stay (unfinished chains'
     // events excepted, plus `performance.anomaly` rows younger than
-    // 30 days — restart dedup needs at most the newest row of the
-    // current day-set, so a month covers many days of re-evaluation
-    // cycles); deliveries of the pruned tail go first so the FK
+    // 30 days and `usage.anomaly` rows younger than 7 days — restart
+    // dedup needs at most the newest rows of the current day-set, so
+    // the bounds cover many days of re-evaluation cycles); deliveries
+    // of the pruned tail go first so the FK
     // never sees an orphan. The LEFT JOIN keeps events that have ANY
     // inflight delivery row out of the pruned sub-select entirely.
-    let exemption_floor = now_epoch() - ANOMALY_RETENTION_EXEMPTION_SECS;
+    let performance_exemption_floor = now_epoch() - ANOMALY_RETENTION_EXEMPTION_SECS;
+    let usage_exemption_floor = now_epoch() - USAGE_ANOMALY_RETENTION_EXEMPTION_SECS;
     tx.execute(
         "DELETE FROM deliveries WHERE event_id IN (
             SELECT pruned.id FROM (
@@ -785,9 +822,15 @@ params![id, event_type, scope, scope_label, payload_json, created_at],
             ON d.event_id = pruned.id AND d.outcome = 'inflight'
             WHERE d.event_id IS NULL AND NOT (
                 pruned.type = 'performance.anomaly' AND pruned.created_at >= ?2
+            ) AND NOT (
+                pruned.type = 'usage.anomaly' AND pruned.created_at >= ?3
             )
         )",
-        params![EVENT_RETENTION_LIMIT, exemption_floor],
+        params![
+            EVENT_RETENTION_LIMIT,
+            performance_exemption_floor,
+            usage_exemption_floor
+        ],
     )?;
     tx.execute(
         "DELETE FROM alert_events WHERE id IN (
@@ -800,9 +843,15 @@ params![id, event_type, scope, scope_label, payload_json, created_at],
             ON d.event_id = pruned.id AND d.outcome = 'inflight'
             WHERE d.event_id IS NULL AND NOT (
                 pruned.type = 'performance.anomaly' AND pruned.created_at >= ?2
+            ) AND NOT (
+                pruned.type = 'usage.anomaly' AND pruned.created_at >= ?3
             )
         )",
-        params![EVENT_RETENTION_LIMIT, exemption_floor],
+        params![
+            EVENT_RETENTION_LIMIT,
+            performance_exemption_floor,
+            usage_exemption_floor
+        ],
     )?;
 tx.commit()?;
 Ok(())
@@ -870,6 +919,29 @@ fn performance_anomaly_scope(payload_json: &str) -> Option<(String, String)> {
     Some((
         data.get("scope")?.as_str()?.to_string(),
         data.get("name")?.as_str()?.to_string(),
+    ))
+}
+
+/// Firing identity of a `usage.anomaly` payload for `day`: the
+/// envelope's `data.key_id` + `data.signal` (the day comes in as the
+/// third tuple slot), read only when `data.evaluated_day` equals
+/// `day` — the per-finding dedup key (Req 3.5), mirroring
+/// [`performance_anomaly_scope`]'s payload-as-source-of-truth read.
+/// A malformed payload, a missing field, or another day yields
+/// `None` (the row is not a recorded firing of `day`).
+fn usage_anomaly_firing_of(
+    payload_json: &str,
+    day: &str,
+) -> Option<(String, String, String)> {
+    let payload = serde_json::from_str::<serde_json::Value>(payload_json).ok()?;
+    let data = payload.get("data")?.as_object()?;
+    if data.get("evaluated_day")?.as_str()? != day {
+        return None;
+    }
+    Some((
+        data.get("key_id")?.as_str()?.to_string(),
+        data.get("signal")?.as_str()?.to_string(),
+        day.to_string(),
     ))
 }
 
@@ -1312,7 +1384,248 @@ fn retention_prunes_old_anomaly_rows_but_keeps_fresh_ones() {
         events.iter().any(|row| row.id == "evt-anomaly-fresh"),
         "fresh anomaly row kept by the age-bounded exemption"
     );
-}
+    }
+
+    #[test]
+    fn retention_prunes_old_usage_anomaly_rows_but_keeps_fresh_ones() {
+        let (store, _tmp) = temp_store();
+        let now = now_epoch();
+        // A usage.anomaly row older than the 7-day exemption falls
+        // out of the 500-newest window and prunes like any budget
+        // row (Req 3.6: shorter bound because per-key volume is
+        // higher).
+        store
+            .insert_event(
+                "evt-usage-old",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                "{}",
+                now - USAGE_ANOMALY_RETENTION_EXEMPTION_SECS - 60,
+            )
+            .unwrap();
+        // A fresh usage.anomaly row (inside 7 days) stays even in
+        // the tail — restart dedup survives alert storms.
+        store
+            .insert_event(
+                "evt-usage-fresh",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                "{}",
+                now - 60,
+            )
+            .unwrap();
+        // A usage.anomaly row between 7 and 30 days old: past its
+        // own exemption, pruned even though the performance-anomaly
+        // bound would still cover it.
+        store
+            .insert_event(
+                "evt-usage-mid",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                "{}",
+                now - USAGE_ANOMALY_RETENTION_EXEMPTION_SECS - 60,
+            )
+            .unwrap();
+        for n in 1..=EVENT_RETENTION_LIMIT {
+            store
+                .insert_event(
+                    &format!("evt-{n:03}"),
+                    "budget.warning",
+                    "provider",
+                    "openai",
+                    "{}",
+                    now + n,
+                )
+                .unwrap();
+        }
+        let events = store.recent_events(1000);
+        assert!(
+            events.iter().all(|row| row.id != "evt-usage-old"),
+            "usage.anomaly row older than 7 days prunes normally"
+        );
+        assert!(
+            events.iter().any(|row| row.id == "evt-usage-fresh"),
+            "fresh usage.anomaly row kept by the age-bounded exemption"
+        );
+    }
+
+    #[test]
+    fn usage_anomaly_between_7_and_30_days_prunes_while_performance_anomaly_keeps() {
+        let (store, _tmp) = temp_store();
+        let now = now_epoch();
+        // Same age for both types: past the usage 7-day bound (pruned)
+        // but inside the performance 30-day bound (kept) — the two
+        // exemption windows are distinct.
+        let mid_age = USAGE_ANOMALY_RETENTION_EXEMPTION_SECS + 60;
+        store
+            .insert_event(
+                "evt-usage-mid",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                "{}",
+                now - mid_age,
+            )
+            .unwrap();
+        store
+            .insert_event(
+                "evt-performance-mid",
+                "performance.anomaly",
+                "provider",
+                "openai",
+                "{}",
+                now - mid_age,
+            )
+            .unwrap();
+        for n in 1..=EVENT_RETENTION_LIMIT {
+            store
+                .insert_event(
+                    &format!("evt-{n:03}"),
+                    "budget.warning",
+                    "provider",
+                    "openai",
+                    "{}",
+                    now + n,
+                )
+                .unwrap();
+        }
+        let events = store.recent_events(1000);
+        assert!(
+            events.iter().all(|row| row.id != "evt-usage-mid"),
+            "usage.anomaly row past its 7-day bound prunes even inside the performance 30-day window"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|row| row.id == "evt-performance-mid"),
+            "performance.anomaly row inside its 30-day bound still kept"
+        );
+    }
+
+    #[test]
+    fn fetch_recorded_firings_returns_usage_anomaly_identities_for_seeded_day() {
+        let (store, _tmp) = temp_store();
+        let payload = |key_id: &str, signal: &str, day: &str| {
+            serde_json::json!({
+                "data": {
+                    "signal": signal,
+                    "scope": "virtual_key",
+                    "key_id": key_id,
+                    "observed_value": 12.0,
+                    "baseline_value": 2.0,
+                    "unit": "usd",
+                    "evaluated_day": day,
+                    "threshold": ">=3x baseline and >=$50 over"
+                }
+            })
+            .to_string()
+        };
+        store
+            .insert_event(
+                "evt-firing-1",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                &payload("7", "spend", "2026-11-23"),
+                1000,
+            )
+            .unwrap();
+        // Same key, different signal: a distinct finding.
+        store
+            .insert_event(
+                "evt-firing-2",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                &payload("7", "odd_hours", "2026-11-23"),
+                1001,
+            )
+            .unwrap();
+        // Another key, same signal/day: distinct identity.
+        store
+            .insert_event(
+                "evt-firing-3",
+                "usage.anomaly",
+                "virtual_key",
+                "key:9:ops",
+                &payload("9", "spend", "2026-11-23"),
+                1002,
+            )
+            .unwrap();
+        // A different day: not part of the seeded day's set.
+        store
+            .insert_event(
+                "evt-firing-other-day",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                &payload("7", "spend", "2026-11-22"),
+                1003,
+            )
+            .unwrap();
+        // A display-name-only rename (same key id, same signal,
+        // same day) records the same identity — name is cosmetic.
+        store
+            .insert_event(
+                "evt-firing-renamed",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                &payload("7", "spend", "2026-11-23"),
+                1004,
+            )
+            .unwrap();
+        // Other event types are not part of a usage.anomaly lookup.
+        store
+            .insert_event(
+                "evt-firing-perf",
+                "performance.anomaly",
+                "provider",
+                "openai",
+                r#"{"data":{"signal":"spend","key_id":"7","evaluated_day":"2026-11-23"}}"#,
+                1005,
+            )
+            .unwrap();
+        // A malformed payload row is skipped, not fatal.
+        store
+            .insert_event(
+                "evt-firing-malformed",
+                "usage.anomaly",
+                "virtual_key",
+                "key:7:team",
+                "{}",
+                1006,
+            )
+            .unwrap();
+        let firings = store
+            .fetch_recorded_firings("usage.anomaly", "2026-11-23")
+            .unwrap();
+        let expected: std::collections::HashSet<(String, String, String)> = [
+            ("7".to_string(), "spend".to_string(), "2026-11-23".to_string()),
+            (
+                "7".to_string(),
+                "odd_hours".to_string(),
+                "2026-11-23".to_string(),
+            ),
+            ("9".to_string(), "spend".to_string(), "2026-11-23".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(firings, expected);
+        // The other day has its own set.
+        let other_day = store
+            .fetch_recorded_firings("usage.anomaly", "2026-11-22")
+            .unwrap();
+        assert!(other_day.contains(&(
+            "7".to_string(),
+            "spend".to_string(),
+            "2026-11-22".to_string()
+        )));
+        assert_eq!(other_day.len(), 1);
+    }
 
 #[test]
 fn retention_keeps_events_of_inflight_chains() {

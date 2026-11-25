@@ -165,6 +165,7 @@ fn base_config(base_url: &str) -> Config {
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+        usage_anomaly_alerts: Default::default(),
     }
 }
 

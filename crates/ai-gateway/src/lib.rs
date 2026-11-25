@@ -37,6 +37,7 @@ pub mod telemetry;
 pub mod tool_compression;
 #[cfg(feature = "tray")]
 pub mod tray;
+pub mod usage_anomaly_alerts;
 pub mod virtual_keys;
 pub mod web_search;
 pub mod webhooks;

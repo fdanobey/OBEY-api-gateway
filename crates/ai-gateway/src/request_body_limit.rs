@@ -229,6 +229,7 @@ mod tests {
             opentelemetry: Default::default(),
             model_deprecations: Default::default(),
             performance_alerts: Default::default(),
+            usage_anomaly_alerts: Default::default(),
         }
     }
 

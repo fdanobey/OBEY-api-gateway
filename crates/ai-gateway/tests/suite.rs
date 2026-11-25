@@ -95,6 +95,7 @@ mod token_compression_observability;
 mod token_compression_short_circuit_property;
 mod trailing_spend_query;
 mod tray_integration;
+mod usage_anomaly_alerts_emission;
 mod virtual_key_priority;
 mod virtual_keys_integration;
 mod model_deprecation_admin;

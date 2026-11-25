@@ -816,7 +816,8 @@ fn budget_event_type_name(event_type: &BudgetEventType) -> &'static str {
 BudgetEventType::ModelDeprecated => "model.deprecated",
 BudgetEventType::BudgetForecastWarning => "budget.forecast.warning",
 BudgetEventType::PerformanceAnomaly => "performance.anomaly",
-}
+BudgetEventType::UsageAnomaly => "usage.anomaly",
+ }
 }
 
 /// Ledger `scope_label` (design ledger schema): provider name, or

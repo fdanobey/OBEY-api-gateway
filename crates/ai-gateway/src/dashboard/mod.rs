@@ -685,12 +685,32 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
                 // Payload parsed once; every optional field is extracted
                 // the same tolerant way `threshold_percent` is (missing
                 // key ⇒ None; budget/deprecation rows simply carry no
-                // performance keys).
+                // performance/usage keys).
                 let payload = serde_json::from_str::<serde_json::Value>(
                     &row.payload_json,
                 )
                 .ok();
                 let data = payload.as_ref().and_then(|p| p.get("data"));
+                // usage.anomaly rows carry the key's identity in the
+                // payload (`data.name` display name, `data.key_id`
+                // always present, never the `vk_` secret) while the
+                // D9 value-envelope path stores a generic scope_label
+                // — the alert-feed extraction arm prefers the display
+                // name, then the key id, mirroring how
+                // `performance.anomaly` rows surface their scope
+                // name.
+                let usage_scope_label = (row.event_type == "usage.anomaly")
+                    .then(|| {
+                        data.and_then(|data| data.get("name"))
+                            .and_then(|name| name.as_str())
+                            .map(|name| name.to_string())
+                            .or_else(|| {
+                                data.and_then(|data| data.get("key_id"))
+                                    .and_then(|key_id| key_id.as_str())
+                                    .map(|key_id| format!("key:{key_id}"))
+                            })
+                    })
+                    .flatten();
                 crate::metrics::AlertSummary {
                     threshold_percent: data
                         .and_then(|data| data.get("percent"))
@@ -708,7 +728,7 @@ async fn build_dashboard_snapshot(state: &AppState) -> crate::metrics::MetricsSn
                         .and_then(|value| value.as_f64()),
                     event_type: row.event_type,
                     scope: row.scope,
-                    scope_label: row.scope_label,
+                    scope_label: usage_scope_label.unwrap_or(row.scope_label),
                     fired_at: row.created_at,
                 }
             })
@@ -1518,6 +1538,7 @@ mod tests {
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+            usage_anomaly_alerts: Default::default(),
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,

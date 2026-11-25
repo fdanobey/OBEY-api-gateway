@@ -27,6 +27,7 @@
 - [Budgets & Alerts](Budgets-and-Alerts)
 - [Spend Pace Forecasting](Spend-Pace-Forecasting)
 - [Model Deprecation Alerts](Model-Deprecation-Alerts)
+- [Usage Anomaly Alerts](Usage-Anomaly-Alerts)
 - [Cost Reports](Cost-Reports)
 - [Guardrail Pipelines](Guardrail-Pipelines)
 - [Agent Loop Detection](Agent-Loop-Detection)

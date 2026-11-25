@@ -94,6 +94,7 @@ fn compat_config(compat: ReasoningCompatConfig, max_retries: u32) -> Config {
     opentelemetry: Default::default(),
     model_deprecations: Default::default(),
     performance_alerts: Default::default(),
+    usage_anomaly_alerts: Default::default(),
     }
 }
 

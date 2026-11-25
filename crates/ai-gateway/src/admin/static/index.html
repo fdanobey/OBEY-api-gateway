@@ -2815,6 +2815,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-model-deprecated" value="model.deprecated" disabled><label for="wh-f-event-model-deprecated">model.deprecated</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-forecast" value="budget.forecast.warning" disabled><label for="wh-f-event-forecast">budget.forecast.warning</label></div>
 <div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-performance" value="performance.anomaly" disabled><label for="wh-f-event-performance">performance.anomaly</label></div>
+<div class="form-check" style="margin:0"><input type="checkbox" class="wh-f-event" id="wh-f-event-usage" value="usage.anomaly" disabled><label for="wh-f-event-usage">usage.anomaly</label></div>
 </div>
 </div>
 <div class="hint">Unchecking "All" enables per-event filtering. At least one event must be selected.</div>
@@ -2879,6 +2880,14 @@ body.sec-banner-active{padding-top:3.2rem}
 <label for="pa-enabled">Enable performance alerts</label>
 </div>
 <div class="hint" style="margin-top:-.5rem;margin-left:1.5rem">Daily anomaly detection (spend, traffic, latency, error rate) against a 7-day baseline. Findings deliver as performance.anomaly webhook events. Saved with the main config Save button.</div>
+</fieldset>
+
+<fieldset><legend>Usage Anomaly Alerts</legend>
+<div class="form-check">
+<input type="checkbox" id="uaa-enabled" checked>
+<label for="uaa-enabled">Enable usage anomaly alerts</label>
+</div>
+<div class="hint" style="margin-top:-.5rem;margin-left:1.5rem">Per-key anomaly detection (spend, traffic, tokens, activity, odd hours, new models, probes) against each key's own 7-day baseline. Findings deliver as usage.anomaly webhook events. See the Usage-Anomaly-Alerts wiki page.</div>
 </fieldset>
 
 <div class="actions">
@@ -5463,6 +5472,7 @@ populateTelemetry(cfg.opentelemetry);
 var mdCfg=cfg.model_deprecations||{};
 populateNonNegativeInt('md-warn-days',mdCfg.warn_days_before,30);
 document.getElementById('pa-enabled').checked=(cfg.performance_alerts||{}).enabled!==false;
+document.getElementById('uaa-enabled').checked=(cfg.usage_anomaly_alerts||{}).enabled!==false;
 }
 
   function populateSmartRouting(value){
@@ -5653,6 +5663,7 @@ cfg.opentelemetry=collectTelemetry();
 var mdWarnDays=parseInt(document.getElementById('md-warn-days').value,10);
 cfg.model_deprecations={warn_days_before:(Number.isFinite(mdWarnDays)&&mdWarnDays>=1&&mdWarnDays<=365)?mdWarnDays:30};
 cfg.performance_alerts={enabled:document.getElementById('pa-enabled').checked};
+cfg.usage_anomaly_alerts={enabled:document.getElementById('uaa-enabled').checked};
 return cfg;
   }
 
@@ -9144,7 +9155,7 @@ document.getElementById('mem-qdrant-recreate').addEventListener('click', functio
   });
 
   // --- Webhooks UI Logic (budget-alerts-unified-webhooks, Req 5.1, 5.2, 5.5) ---
-var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset', 'model.deprecated', 'budget.forecast.warning', 'performance.anomaly'];
+var WH_EVENTS = ['budget.warning', 'budget.exhausted', 'budget.reset', 'model.deprecated', 'budget.forecast.warning', 'performance.anomaly', 'usage.anomaly'];
 
 // --- Tracing UI Logic (opentelemetry-trace-export, Req 8.1, 8.2, 7.3) ---
 // otelState.headers holds editor rows; a value left equal to the

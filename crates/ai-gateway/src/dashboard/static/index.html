@@ -868,14 +868,16 @@ empty.style.display='none';
  'budget.exhausted': 'badge-alert-exhausted',
  'budget.reset': 'badge-alert-reset',
  'budget.forecast.warning': 'badge-alert-forecast',
- 'performance.anomaly': 'badge-alert-perf'
+ 'performance.anomaly': 'badge-alert-perf',
+ 'usage.anomaly': 'badge-alert-perf'
  };
  var typeLabel = {
  'budget.warning': 'warning',
  'budget.exhausted': 'exhausted',
  'budget.reset': 'reset',
  'budget.forecast.warning': 'forecast',
- 'performance.anomaly': 'anomaly'
+ 'performance.anomaly': 'anomaly',
+ 'usage.anomaly': 'usage-anomaly'
  };
 var html='';
  alerts.forEach(function(a){
@@ -886,12 +888,12 @@ var html='';
  // "type, scope_label, threshold kind, fired_at").
  var suffix = (etype==='budget.warning' && a.threshold_percent!=null)
  ? ' ' + a.threshold_percent + '%' : '';
-// Performance rows render the server-provided observed/baseline
-// pair plus the signal; JS renders only, never derives (no
-// client-side ratio math). Missing fields degrade to label-only
-// (spec: handle missing gracefully).
-var detail = '';
-if(etype==='performance.anomaly'){
+ // Performance/usage anomaly rows render the server-provided
+ // observed/baseline pair plus the signal; JS renders only, never
+ // derives (no client-side ratio math). Missing fields degrade to
+ // label-only (spec: handle missing gracefully).
+ var detail = '';
+ if(etype==='performance.anomaly'||etype==='usage.anomaly'){
 var sig = a.signal!=null ? String(a.signal) : '';
 if(a.observed_value!=null && a.baseline_value!=null){
 detail = (sig?sig+' ':'')

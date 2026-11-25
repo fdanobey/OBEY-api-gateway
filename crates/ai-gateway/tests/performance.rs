@@ -302,6 +302,7 @@ fn build_router_from_fixture(fixture: &ProviderSelectionFixture) -> Router {
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+        usage_anomaly_alerts: Default::default(),
     };
     common::isolate_databases(&mut config);
     Router::new(Arc::new(RwLock::new(config)), test_metrics())
@@ -787,6 +788,7 @@ fn test_config() -> Config {
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+        usage_anomaly_alerts: Default::default(),
     }
 }
 
@@ -1599,6 +1601,7 @@ fn build_cardinality_scenario(scenario: &CardinalityScenario) -> (Arc<RwLock<Con
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+        usage_anomaly_alerts: Default::default(),
     };
     common::isolate_databases(&mut config);
     let shared = Arc::new(RwLock::new(config));

@@ -152,6 +152,74 @@ pub struct PerformanceAnomalyData {
     pub threshold: String,
 }
 
+/// Typed `data` body of a `usage.anomaly` event
+/// (usage-anomaly-alerts design "Event payload", fields verbatim):
+/// the per-key finding that fired for one (key, signal, day) against
+/// the key's own 7-day baseline. `signal` and `unit` are the wire
+/// names as plain strings so this payload stands alone from the
+/// evaluation core's enums; `key_id` is the dedup identity — never
+/// the `vk_` secret value — and `name` is the cosmetic display name.
+/// Like the performance payload, the struct carries only aggregates
+/// — no request bodies, no key material — so the no-secret
+/// invariant holds by construction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageAnomalyData {
+    /// Signal that fired: `spend` | `traffic` | `tokens` |
+    /// `new_activity` | `odd_hours` | `new_model` | `probes`.
+    pub signal: String,
+    /// Always `"virtual_key"` (the only usage-anomaly scope).
+    pub scope: String,
+    /// Virtual-key id — the dedup identity; never the `vk_` value.
+    pub key_id: String,
+    /// Key display name (cosmetic only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Observed day's value for the signal.
+    pub observed_value: f64,
+    /// 7-day rolling baseline value at evaluation time.
+    pub baseline_value: f64,
+    /// `usd` | `requests` | `tokens` | `ratio`.
+    pub unit: String,
+    /// UTC day the finding evaluated (ISO `YYYY-MM-DD`).
+    pub evaluated_day: String,
+    /// Signal-specific context (bucket share, model name,
+    /// validation-failure count).
+    pub detail: String,
+    /// Human-readable fixed condition that fired.
+    pub threshold: String,
+}
+
+impl UsageAnomalyData {
+    /// Build a `usage.anomaly` data body for one (key, signal, day)
+    /// finding: scope is fixed `"virtual_key"`; `key_id` is the
+    /// virtual key's id (never the `vk_` secret); `name` is the
+    /// cosmetic display name.
+    pub fn new(
+        signal: String,
+        key_id: String,
+        name: Option<String>,
+        observed_value: f64,
+        baseline_value: f64,
+        unit: String,
+        evaluated_day: String,
+        detail: String,
+        threshold: String,
+    ) -> Self {
+        Self {
+            signal,
+            scope: "virtual_key".to_string(),
+            key_id,
+            name,
+            observed_value,
+            baseline_value,
+            unit,
+            evaluated_day,
+            detail,
+            threshold,
+        }
+    }
+}
+
 /// The webhook event envelope (design "Event envelope"). Field names are
 /// verbatim on the wire: `{"id","type","created_at","signed","data":{...}}`.
 /// `type` reuses the config module's [`BudgetEventType`] (Task 1) — one
@@ -613,27 +681,176 @@ fn anomaly_payload_round_trips() {
             );
         }
 
-        let hostile = PerformanceAnomalyData {
-            name: "vk_test123 sk-abc Bearer api_key authorization".to_string(),
-            threshold: "vk_ prefix sk- Bearer api_key authorization".to_string(),
-            ..data
-        };
-        let value = serde_json::to_value(&hostile).expect("serializes");
-        let object = value.as_object().expect("object");
-        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            vec![
-                "baseline_value",
-                "evaluated_day",
-                "name",
-                "observed_value",
-                "scope",
-                "signal",
-                "threshold",
-                "unit",
-            ]
-        );
+ let hostile = PerformanceAnomalyData {
+ name: "vk_test123 sk-abc Bearer api_key authorization".to_string(),
+ threshold: "vk_ prefix sk- Bearer api_key authorization".to_string(),
+ ..data
+ };
+ let value = serde_json::to_value(&hostile).expect("serializes");
+ let object = value.as_object().expect("object");
+ let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+ keys.sort_unstable();
+ assert_eq!(
+ keys,
+ vec![
+ "baseline_value",
+ "evaluated_day",
+ "name",
+ "observed_value",
+ "scope",
+ "signal",
+ "threshold",
+ "unit",
+ ]
+ );
+ }
+
+/// Usage-anomaly payload: exact field set and names (signal, scope,
+/// key_id, name, observed_value, baseline_value, unit, evaluated_day,
+/// detail, threshold), `evaluated_day` rendered ISO `YYYY-MM-DD`.
+/// Byte-stable like every other payload — any drift here is a
+/// receiver-visible wire break.
+// Validates: usage-anomaly-alerts design "Event payload" (Req 3.3)
+#[test]
+    fn usage_anomaly_payload_serializes_to_exact_json() {
+    let data = UsageAnomalyData::new(
+    "spend".to_string(),
+    "key-42".to_string(),
+    Some("prod-key".to_string()),
+    180.0,
+    40.0,
+    "usd".to_string(),
+    "2025-11-22".to_string(),
+    "observed $180.00 vs baseline $40.00".to_string(),
+    ">=3x baseline and >=$50 over".to_string(),
+    );
+    let json = serde_json::to_string(&data).expect("serializes");
+    let expected = concat!(
+    r#"{"signal":"spend","scope":"virtual_key","key_id":"key-42","#,
+    r#""name":"prod-key","observed_value":180.0,"baseline_value":40.0,"#,
+    r#""unit":"usd","evaluated_day":"2025-11-22","#,
+    r#""detail":"observed $180.00 vs baseline $40.00","#,
+    r#""threshold":">=3x baseline and >=$50 over"}"#
+    );
+    assert_eq!(json, expected);
+    }
+
+/// A missing display name serializes without the `name` key — the
+/// payload shape stays byte-stable for legacy keys with no name.
+// Validates: usage-anomaly-alerts design "Event payload"
+#[test]
+    fn usage_anomaly_payload_without_name_omits_the_key() {
+    let data = UsageAnomalyData::new(
+    "new_activity".to_string(),
+    "key-7".to_string(),
+    None,
+    25.0,
+    0.0,
+    "requests".to_string(),
+    "2026-01-05".to_string(),
+    "first traffic after 7 idle days".to_string(),
+    ">=25 requests on the evaluated day".to_string(),
+    );
+    let json = serde_json::to_string(&data).expect("serializes");
+    assert!(!json.contains(r#""name":"#));
+    assert!(json.contains(r#""key_id":"key-7""#));
+    }
+
+/// Usage-anomaly payload round-trips through serde (receiver side
+/// deserializes the exact wire bytes back to the same value).
+// Validates: usage-anomaly-alerts design "Event payload"
+#[test]
+    fn usage_anomaly_payload_round_trips() {
+    let data = UsageAnomalyData::new(
+    "odd_hours".to_string(),
+    "key-123".to_string(),
+    Some("nightly-batch".to_string()),
+    5200.0,
+    1000.0,
+    "requests".to_string(),
+    "2026-01-05".to_string(),
+    "62% of requests in low-share buckets".to_string(),
+    ">=50% of requests in buckets with <2% baseline share".to_string(),
+    );
+    let json = serde_json::to_string(&data).expect("serializes");
+    let back: UsageAnomalyData = serde_json::from_str(&json).expect("deserializes");
+    assert_eq!(back, data);
+    }
+
+/// No-secret invariant (Req 3.3): the payload's serialized JSON
+/// carries the key ID and display name but never any `vk_` key
+/// material — the struct has no field capable of carrying it, so the
+/// invariant holds by construction and this asserts the bytes. A
+/// HOSTILE display name that looks like a secret (`sk-abc123`,
+/// `Bearer ...`) stays a plain display-name string: it is not
+/// redacted, not treated as a secret, and cannot smuggle extra
+/// payload fields — the serialized key set stays exactly the fixed
+/// ten-key wire contract, so a future field addition (the smuggling
+/// route) fails here first.
+// Validates: usage-anomaly-alerts design "Event payload" (NFR security, Req 3.3)
+#[test]
+    fn usage_anomaly_payload_carries_no_secrets() {
+    let data = UsageAnomalyData::new(
+    "probes".to_string(),
+    "key-99".to_string(),
+    Some("staging".to_string()),
+    120.0,
+    8.0,
+    "requests".to_string(),
+    "2025-11-23".to_string(),
+    "validation-class failures: 120 (baseline 8)".to_string(),
+    ">=50 failures and >=5x baseline".to_string(),
+    );
+    let json = serde_json::to_string(&data).expect("serializes");
+    // The clean payload carries no secret markers.
+    for marker in ["vk_", "sk-", "Bearer ", "api_key", "authorization"] {
+    assert!(
+    !json.to_ascii_lowercase().contains(
+    marker.to_ascii_lowercase().as_str()
+    ),
+    "payload JSON must not contain {marker:?}: {json}"
+    );
+    }
+
+    // A hostile DISPLAY NAME that looks like key material is carried
+    // verbatim as the cosmetic name (a display name is not a secret and
+    // must not be dropped), but it must never add or rename payload
+    // fields — the wire key set stays the fixed contract.
+    let hostile = UsageAnomalyData::new(
+    "probes".to_string(),
+    "key-99".to_string(),
+    Some("sk-abc123 Bearer vk_test123".to_string()),
+    120.0,
+    8.0,
+    "requests".to_string(),
+    "2025-11-23".to_string(),
+    "vk_test123 sk-abc Bearer api_key authorization".to_string(),
+    ">=50 failures and >=5x baseline".to_string(),
+    );
+    let value = serde_json::to_value(&hostile).expect("serializes");
+    let object = value.as_object().expect("object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+    keys,
+    vec![
+    "baseline_value",
+    "detail",
+    "evaluated_day",
+    "key_id",
+    "name",
+    "observed_value",
+    "scope",
+    "signal",
+    "threshold",
+    "unit",
+    ]
+    );
+    // The key id stays the id, not the vk_ value.
+    assert_eq!(object["key_id"], serde_json::json!("key-99"));
+    assert_eq!(
+    object["name"],
+    serde_json::json!("sk-abc123 Bearer vk_test123")
+    );
     }
 }

@@ -346,6 +346,7 @@ mod disabled_providers_config_tests {
             opentelemetry: Default::default(),
             model_deprecations: Default::default(),
             performance_alerts: Default::default(),
+            usage_anomaly_alerts: Default::default(),
             tool_compression: Default::default(),
             smart_routing: Default::default(),
             memory: None,

@@ -147,12 +147,18 @@ When both virtual keys and [guardrail pipelines](Guardrail-Pipelines) are active
 ```yaml
 guardrails:
   bindings:
-    virtual_keys:
-      vk_team_a: standard
-      vk_external: strict-pii
+virtual_keys:
+  vk_team_a: standard
+  vk_external: strict-pii
 ```
 
 This allows different policy enforcement per caller.
+
+---
+
+## Usage Anomaly Alerts
+
+[Usage anomaly alerts](Usage-Anomaly-Alerts) baseline each key's own usage from the requests ledger and fire a `usage.anomaly` webhook when a completed day deviates far enough — a spend spike, odd-hours activity, a model the key never used, or a burst of validation failures. Detection only: findings never block a key. Disabling the key or its budgets remains the containment path.
 
 ---
 

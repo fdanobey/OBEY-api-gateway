@@ -48,10 +48,10 @@ Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_da
 
 ## Non-Obvious Patterns
 
-- **API key resolution**: `api_key_env` in config is tried as env var name first, falls back to literal value if env var not found ([`router.rs:286-291`](crates/ai-gateway/src/router/router.rs:286))
-- **Base URL normalization**: Provider URLs are stripped of trailing `/` and `/v1` is appended if missing ([`router.rs:278-283`](crates/ai-gateway/src/router/router.rs:278))
-- **Config path resolution**: CLI `--config` → `CONFIG_PATH` env → `./config.yaml` ([`validation.rs`](crates/ai-gateway/src/config/validation.rs))
-- **Circuit breaker reset**: All circuit breakers clear on config hot-reload via `/admin/config/reload`
+- **Provider API key resolution** (`Provider::resolve_api_key` in [`config/mod.rs`](crates/ai-gateway/src/config/mod.rs)): the decrypted `api_key_encrypted` / `resolved_api_key` wins; otherwise `api_key_env` is read as an env var only when it looks like one (`secrets::is_env_var_reference`, UPPER_SNAKE). A plaintext key typed into `api_key_env` is encrypted into `api_key_encrypted` on save (`normalize_config_for_storage` in `admin/mod.rs`, helpers in `secrets.rs`). Guardrail and web-search backends still use the older rule: env var first, literal fallback (`resolve_api_key(api_key_env)`).
+- **Base URL normalization**: Provider URLs are stripped of trailing `/` and `/v1` is appended if missing (`dispatch_attempts_under_permit` in [`router.rs`](crates/ai-gateway/src/router/router.rs)). Bedrock in API-key mode without `custom_vpc_endpoint` ignores `base_url` and uses `https://bedrock-mantle.<region>.api.aws/v1`.
+- **Config path resolution**: CLI `--config` → `CONFIG_PATH` env → `./config.yaml` (`resolve_config_path` in [`validation.rs`](crates/ai-gateway/src/config/validation.rs))
+- **Hot-reload resets runtime state**: `/admin/config/reload` clears circuit breakers, rate limiters, retry budgets, the sticky cache and HTTP clients (`apply_runtime_config_update` in `gateway/mod.rs`). `/admin/circuit-breaker/reset` clears breakers alone.
 - **Tests use `tower::ServiceExt::oneshot()`**: Integration tests don't bind ports; they call router directly
 - **Property tests with proptest**: Many tests use `proptest!` macro for randomized input validation
 - **Admin panel parity (standing user requirement)**: every YAML-configurable feature must also expose matching controls in the embedded admin panel (`crates/ai-gateway/src/admin/static/index.html`). Config-only features without UI are considered incomplete; specs must include admin-UI tasks.
@@ -61,7 +61,14 @@ Every `GatewayServer::new` opens SQLite databases. Tests use `common::isolate_da
   - Timeout-class errors (TTFB/total/chunk timeout, upstream 504/524) fail over without a same-provider retry (`is_timeout_class`). 500/502/network errors keep `max_retries_per_provider`. Pass-through TTFB/send/5xx fallbacks exclude the failed `provider:model`, as the 429 path does.
   - Every failed try and every abandoned request is logged through the `ActiveRequestHandle` attempt ledger: `#attempt` rows with `duration_ms`/`error_class`, and 499 `client_disconnect` / 504 `gateway_deadline` outcome rows written by `RequestCompleteGuard`. Do not reintroduce response-extras channels for attempts.
   - Guard tests: `buffered_sse_reader_allows_generation_longer_than_ttfb_when_bytes_flow`, `buffered_dispatch_requests_upstream_stream_and_reassembles_sse`, `timeout_class_errors_fail_over_without_same_provider_retry` (router.rs) and `abandoned_stream_writes_client_disconnect_outcome_row` (tests/request_outcome_logging.rs).
+- **Buffered reasoning progress relay** (see [ADR 0003](docs/adr/0003-buffered-reasoning-progress-relay.md)): while a streaming request is buffered, `read_upstream_body` copies reasoning-only deltas (`classify_reasoning_frame`, fail-closed) into a bounded fail-open channel on `ActiveRequestHandle`, and the handler forwards them as `chat.completion.chunk` frames between keep-alives so client first-token timeouts don't fire. The final replay omits already-relayed reasoning. Toggle: `streaming.relay_reasoning_progress` (default `true`). The relay is transport only; it never consumes rate tokens or delays dispatch.
 - **Provider rate-limit accounting** (see [ADR 0002](docs/adr/0002-provider-rate-limit-accounting.md); do not regress): exactly one token per real upstream request. Admission (`FirstSendToken::Prepaid`) is the only gate and may wait up to `rate_limit_max_wait_ms` for the primary with nothing held. Every retry, Codex Search round or nudge is `debit`ed and never blocks. The Errors tab filters errors in SQL. Guard tests: `single_request_consumes_exactly_one_provider_rate_token`, `sequential_requests_under_limit_never_rate_limit_skip`, `rate_limit_skip_waits_briefly_for_primary_token`, `errors_tab_includes_failed_attempts_on_successful_request`.
+
+## Branches, CI & Release
+
+- `development` is the integration branch: feature PRs and Dependabot target it. Never push or open feature PRs to `master`; only the Release workflow advances it.
+- CI (`.github/workflows/ci.yml`) runs on push/PR to `development`: `Build & validate fallback catalogs` (`cargo check -p ai-gateway --all-targets` with `RUSTFLAGS=-D warnings`, then NVIDIA NIM fixture validation) is the required check; `Supply-chain gate (cargo-deny)` also runs.
+- Releases: see `.kiro/steering/bump-version-release.md`.
 
 ## Agent skills
 

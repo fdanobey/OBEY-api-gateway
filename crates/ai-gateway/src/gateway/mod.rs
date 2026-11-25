@@ -160,6 +160,16 @@ pub deprecation_scanner: Arc<crate::model_deprecations::scanner::ModelMetadataSc
     /// oneshot tests).
     pub performance_alert_state:
         Arc<crate::performance_alerts::emission::PerformanceAlertState>,
+    /// Usage-anomaly-alerts emission state (usage-anomaly-alerts
+    /// spec, Task 6): the per-key daily-drift evaluation
+    /// orchestrator over the requests ledger, sharing the config /
+    /// logger / ledger / notifier Arcs plus the virtual-key name
+    /// resolver. The hourly background loop is spawned ONLY in
+    /// [`GatewayServer::start_with_shutdown`] — never here — so
+    /// `GatewayServer::new` stays test-safe (no timers firing in
+    /// oneshot tests).
+    pub usage_anomaly_alert_state:
+        Arc<crate::usage_anomaly_alerts::emission::UsageAnomalyAlertState>,
     /// OTLP trace exporter (opentelemetry-trace-export spec, task
     /// 6). Dormant until `apply_config` sees an enabled section;
     /// span emission runs at the request-completion seams in
@@ -326,14 +336,14 @@ impl GatewayServer {
     // same config / logger / ledger / notifier Arcs AppState holds.
     // No timers start here — the hourly loop lives in
     // `start_with_shutdown` (the deprecation-scanner discipline).
-    let performance_alert_state = Arc::new(
-        crate::performance_alerts::emission::PerformanceAlertState::new(
-            config_arc.clone(),
-            logger_arc.clone(),
-            webhook_ledger.clone(),
-            webhook_notifier.clone(),
-        ),
-    );
+        let performance_alert_state = Arc::new(
+            crate::performance_alerts::emission::PerformanceAlertState::new(
+                config_arc.clone(),
+                logger_arc.clone(),
+                webhook_ledger.clone(),
+                webhook_notifier.clone(),
+            ),
+        );
     let deprecation_scanner =
             Arc::new(crate::model_deprecations::scanner::ModelMetadataScanner::with_emission(
                 config_arc.clone(),
@@ -666,6 +676,30 @@ forecast.as_ref(),
         // Priority-classes Task 4: the admission gate resolves the authenticated
         // key's priority class through the shared manager (read-only).
         router.set_virtual_key_manager(virtual_key_manager.clone());
+// Usage-anomaly-alerts emission state (Task 6): built once on the
+// same config / logger / ledger / notifier Arcs AppState holds,
+// plus the virtual-key name resolver (key id → display name,
+// never the `vk_` secret). No timers start here — the hourly loop
+// lives in `start_with_shutdown` (the deprecation-scanner
+// discipline).
+let key_store = virtual_key_manager.store_for_priority().clone();
+let key_name_resolver: crate::usage_anomaly_alerts::emission::KeyNameResolver =
+    Arc::new(move |key_id: &str| {
+        key_store
+            .get_key_by_id(key_id)
+            .ok()
+            .flatten()
+            .and_then(|stored| stored.name)
+    });
+let usage_anomaly_alert_state = Arc::new(
+    crate::usage_anomaly_alerts::emission::UsageAnomalyAlertState::new(
+        config_arc.clone(),
+        logger_arc.clone(),
+        key_name_resolver,
+        webhook_ledger.clone(),
+        webhook_notifier.clone(),
+    ),
+);
 
         // --- VK alert restart seeding (budget-alerts-unified-webhooks, Task 6) ---
         // Mirrors the provider seeding above (design "Component 1", D11; Reqs
@@ -861,9 +895,10 @@ anchor,
  webhook_ledger,
  provider_budget_alerts,
         deprecation_state,
-        deprecation_scanner,
-        performance_alert_state,
-        webhook_notifier,
+            deprecation_scanner,
+            performance_alert_state,
+            usage_anomaly_alert_state,
+            webhook_notifier,
             telemetry_exporter: telemetry_exporter.clone(),
             telemetry_snapshot: telemetry_snapshot.clone(),
         };
@@ -1314,7 +1349,8 @@ anchor,
  });
 let scanner_shutdown_rx = shutdown_signal_rx.clone();
 let https_shutdown_rx = shutdown_signal_rx.clone();
-let performance_alert_shutdown_rx = shutdown_signal_rx.clone();
+        let performance_alert_shutdown_rx = shutdown_signal_rx.clone();
+        let usage_anomaly_shutdown_rx = shutdown_signal_rx.clone();
 let http_shutdown_rx = shutdown_signal_rx;
 // Model-deprecation scanner background loop (Req 1.1/1.1a):
 // startup scan after 15 s, then every 24 h, stopping with the
@@ -1327,9 +1363,18 @@ self.state
 // ledger dedup seed), then hourly; the `last_evaluated_day`
 // short-circuit keeps repeated ticks of an already-evaluated
 // day query-free. Stops with the same shutdown fan-out.
-self.state
-    .performance_alert_state
-    .spawn_background(performance_alert_shutdown_rx);
+        self.state
+            .performance_alert_state
+            .spawn_background(performance_alert_shutdown_rx);
+        // Usage-anomaly-alerts emission loop (usage-anomaly-alerts
+        // Task 6, design D8): first tick immediate (restart
+        // catch-up via the per-finding ledger dedup), then hourly;
+        // the `last_evaluated_day` short-circuit keeps repeated
+        // ticks of an already-evaluated day query-free. Stops with
+        // the same shutdown fan-out.
+        self.state
+            .usage_anomaly_alert_state
+            .spawn_background(usage_anomaly_shutdown_rx);
 
         if let Some(rustls_config) = rustls_config {
             // Req 36.1: HTTPS only when TLS enabled
@@ -2363,6 +2408,7 @@ mod tests {
             opentelemetry: Default::default(),
             model_deprecations: Default::default(),
             performance_alerts: Default::default(),
+            usage_anomaly_alerts: Default::default(),
         }
     }
 
@@ -3418,6 +3464,7 @@ mod tests {
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+            usage_anomaly_alerts: Default::default(),
     };
 
     let server = GatewayServer::new(cfg, None).await.unwrap();
@@ -4031,6 +4078,7 @@ mod tests {
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+            usage_anomaly_alerts: Default::default(),
     };
 
     // Write new config to disk

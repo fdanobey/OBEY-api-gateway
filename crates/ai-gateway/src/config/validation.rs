@@ -1798,6 +1798,7 @@ mod property_tests {
             opentelemetry: Default::default(),
             model_deprecations: Default::default(),
             performance_alerts: Default::default(),
+            usage_anomaly_alerts: Default::default(),
         }
 }
 
@@ -5506,7 +5507,79 @@ performance_alerts:
  .as_ref()
  .unwrap()
  .contains(&BudgetEventType::PerformanceAnomaly));
+}
+
+// --- Usage anomaly alerts config validation (usage-anomaly-alerts,
+// Req 5.1) ---
+
+#[test]
+fn usage_anomaly_alerts_absent_section_applies_defaults_and_validates() {
+ // Absent section default: enabled (Req 5.1).
+ let config = minimal_valid_config();
+ assert!(config.usage_anomaly_alerts.enabled);
+ assert!(config.validate().is_ok());
+
+ // Explicit section parses.
+ let yaml = "enabled: false";
+ let section: UsageAnomalyAlertsConfig = serde_yaml::from_str(yaml).unwrap();
+ assert!(!section.enabled);
+
+ // Empty section applies defaults.
+ let empty: UsageAnomalyAlertsConfig = serde_yaml::from_str("{}").unwrap();
+ assert_eq!(empty, UsageAnomalyAlertsConfig::default());
+}
+
+#[test]
+fn usage_anomaly_alerts_section_serde_round_trips() {
+ for enabled in [true, false] {
+ let section = UsageAnomalyAlertsConfig { enabled };
+ let serialized = serde_yaml::to_string(&section).unwrap();
+ assert_eq!(serialized, format!("enabled: {enabled}\n"));
+ let reparsed: UsageAnomalyAlertsConfig =
+ serde_yaml::from_str(&serialized).unwrap();
+ assert_eq!(reparsed, section);
  }
+}
+
+#[test]
+fn usage_anomaly_alerts_absent_section_defaults_through_real_load() {
+ // The real entry point shared by startup and hot-reload
+ // (`load_and_validate_config`) deserializes the full document, so
+ // a complete config without a `usage_anomaly_alerts` section loads
+ // with the absent-section default enabled (Req 5.1), and an
+ // explicit `enabled: false` round-trips through the same path.
+ let base_yaml = r#"server:
+   host: "127.0.0.1"
+   port: 8080
+   request_timeout_seconds: 30
+   max_request_size_mb: 10
+providers:
+- name: "openai"
+  type: "openai"
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "sk-test-12345678901234567890"
+  timeout_seconds: 30
+model_groups:
+- name: "default"
+  version_fallback_enabled: false
+  models:
+  - provider: "openai"
+    model: "gpt-4"
+"#;
+ let tempdir = tempfile::tempdir().unwrap();
+ let path = tempdir.path().join("config.yaml");
+ std::fs::write(&path, base_yaml).unwrap();
+ let config = load_and_validate_config(&path).unwrap();
+ assert!(config.usage_anomaly_alerts.enabled);
+
+ std::fs::write(
+ &path,
+ format!("{base_yaml}usage_anomaly_alerts:\n  enabled: false\n"),
+ )
+ .unwrap();
+ let config = load_and_validate_config(&path).unwrap();
+ assert!(!config.usage_anomaly_alerts.enabled);
+}
 
  // --- Model-group output caps (response-output-caps, Req 2.1, 2.5, 2.6) ---
 

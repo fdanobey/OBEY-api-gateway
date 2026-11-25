@@ -185,6 +185,7 @@ fn base_config(enforcement: EnforcementMode) -> Config {
         opentelemetry: Default::default(),
         model_deprecations: Default::default(),
         performance_alerts: Default::default(),
+        usage_anomaly_alerts: Default::default(),
     };
     common::isolate_databases(&mut config);
     config

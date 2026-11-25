@@ -179,6 +179,11 @@ pub model_deprecations: ModelDeprecationsConfig,
 /// `performance-alerts` spec.
 #[serde(default)]
 pub performance_alerts: PerformanceAlertsConfig,
+/// Usage-anomaly detection. Absent section applies
+/// [`UsageAnomalyAlertsConfig::default`] (enabled). See the
+/// `usage-anomaly-alerts` spec.
+#[serde(default)]
+pub usage_anomaly_alerts: UsageAnomalyAlertsConfig,
 }
 
 /// `model_deprecations:` configuration section root
@@ -213,11 +218,31 @@ pub enabled: bool,
 }
 
 impl Default for PerformanceAlertsConfig {
-fn default() -> Self {
-Self {
-enabled: true,
+ fn default() -> Self {
+ Self {
+ enabled: true,
+ }
+ }
 }
+
+/// `usage_anomaly_alerts:` configuration section root
+/// (usage-anomaly-alerts, Req 5.1). Absent section applies defaults
+/// (enabled); thresholds, baseline window, grace, and cadence are fixed
+/// constants. Unknown keys are rejected (`deny_unknown_fields`) so
+/// typos fail at write time instead of silently no-opping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageAnomalyAlertsConfig {
+/// Master switch for usage-anomaly detection and emission.
+pub enabled: bool,
 }
+
+impl Default for UsageAnomalyAlertsConfig {
+ fn default() -> Self {
+  Self {
+   enabled: true,
+  }
+ }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -253,8 +278,9 @@ impl Default for SecurityConfig {
 /// for admin test sends is synthesized by the webhooks module and is not
 /// a configurable event filter value. `model.deprecated`
 /// (model-deprecation-alerts spec), `budget.forecast.warning`
-/// (spend-pace-forecasting spec), and `performance.anomaly`
-/// (performance-alerts spec) ride the same filter; unset endpoint
+/// (spend-pace-forecasting spec), `performance.anomaly`
+/// (performance-alerts spec), and `usage.anomaly`
+/// (usage-anomaly-alerts spec) ride the same filter; unset endpoint
 /// filters are default-on for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BudgetEventType {
@@ -270,6 +296,8 @@ ModelDeprecated,
 BudgetForecastWarning,
 #[serde(rename = "performance.anomaly")]
 PerformanceAnomaly,
+#[serde(rename = "usage.anomaly")]
+UsageAnomaly,
 }
 
 /// A single webhook receiver (budget-alerts-unified-webhooks, Req 3.1).
@@ -2952,5 +2980,79 @@ jitter_ratio: 0.1
         let round_tripped: RetryConfig = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(round_tripped, cfg);
         assert_eq!(round_tripped.upstream_retry_after_max_wait_ms, 15000);
+    }
+}
+
+#[cfg(test)]
+mod usage_anomaly_alerts_config_tests {
+    use super::*;
+
+    // usage-anomaly-alerts, Task 4: UsageAnomalyAlertsConfig section
+    // + BudgetEventType::UsageAnomaly wire name.
+    // **Validates: Requirements 5.1, 5.2, 3.2**
+
+    #[test]
+    fn usage_anomaly_alerts_config_round_trips_both_states() {
+        for enabled in [true, false] {
+            let section = UsageAnomalyAlertsConfig { enabled };
+            let serialized = serde_yaml::to_string(&section).unwrap();
+            assert_eq!(serialized, format!("enabled: {enabled}\n"));
+            let reparsed: UsageAnomalyAlertsConfig =
+                serde_yaml::from_str(&serialized).unwrap();
+            assert_eq!(reparsed, section);
+        }
+    }
+
+    #[test]
+    fn usage_anomaly_alerts_absent_section_defaults_enabled() {
+        // Absent section (whole Config without `usage_anomaly_alerts`)
+        // and empty section both apply the default: enabled.
+        assert!(UsageAnomalyAlertsConfig::default().enabled);
+        let empty: UsageAnomalyAlertsConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(empty.enabled);
+        let yaml = r#"
+server:
+  host: "127.0.0.1"
+  port: 8080
+  request_timeout_seconds: 30
+  max_request_size_mb: 10
+providers: []
+model_groups: []
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.usage_anomaly_alerts.enabled);
+    }
+
+    #[test]
+    fn usage_anomaly_alerts_unknown_key_rejected_naming_the_field() {
+        let yaml = "enabled: true\nanabled: false\n";
+        let error = serde_yaml::from_str::<UsageAnomalyAlertsConfig>(yaml)
+            .expect_err("unknown key must be rejected");
+        assert!(
+            error.to_string().contains("anabled"),
+            "error should name the unknown field: {error}"
+        );
+    }
+
+    #[test]
+    fn usage_anomaly_event_type_serializes_to_wire_name() {
+        // The wire name receivers match on, round-tripped through the
+        // serde rename (Req 3.2); default-on rides the unset filter.
+        assert_eq!(
+            serde_json::to_string(&BudgetEventType::UsageAnomaly).unwrap(),
+            "\"usage.anomaly\""
+        );
+        let yaml = r#"
+endpoints:
+- url: "https://hooks.example.com/alerts"
+  events: ["usage.anomaly"]
+- url: "https://hooks.example.com/all"
+"#;
+        let webhooks: WebhooksConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            webhooks.endpoints[0].events,
+            Some(vec![BudgetEventType::UsageAnomaly])
+        );
+        assert_eq!(webhooks.endpoints[1].events, None);
     }
 }

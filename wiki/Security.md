@@ -124,6 +124,8 @@ api_key_env: "sk-actual-key-here"
 - Revocation is instant — no provider key rotation needed
 - Full `vk_` token shown exactly once at creation; cannot be recovered
 
+[Usage anomaly alerts](Usage-Anomaly-Alerts) complement these controls by watching each key's behavior against its own 7-day baseline — spend spikes, odd-hours activity, never-before-used models, validation bursts — and delivering `usage.anomaly` webhooks. Detection only; containment stays with key disable and budgets.
+
 ---
 
 ## OAuth Token Security
