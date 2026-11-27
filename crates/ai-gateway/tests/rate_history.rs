@@ -61,6 +61,7 @@ fn log_entry(trace_id: &str, timestamp: DateTime<Utc>) -> LogEntry {
         prompt_version: None,
         prompt_label: None,
         output_cap_metadata: None,
+        client_tool: None,
     }
 }
 

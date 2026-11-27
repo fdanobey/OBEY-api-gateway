@@ -96,6 +96,7 @@ fn validated(
         group_by,
         provider: provider.map(str::to_string),
         key_id: key_id.map(str::to_string),
+        client_tool: None,
         format: ai_gateway::cost_reporting::ReportFormat::Json,
     }
 }

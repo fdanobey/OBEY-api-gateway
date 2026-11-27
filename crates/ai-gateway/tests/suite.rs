@@ -27,6 +27,7 @@ mod assistants_crud;
 mod budget_persistence;
 mod budget_rollover;
 mod config_budget_policy;
+mod client_tool_spend;
 mod context_overflow_routing;
 mod cost_reporting;
 mod cost_reporting_admin;

@@ -451,10 +451,11 @@ fn write_decision_log(state: &AppState, trace_id: &str, row: DecisionLogRow) {
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         };
         if let Err(error) = state.logger.log(entry) {
-        tracing::warn!(%error, trace_id = %trace_id, "Failed to write request log entry");
-    }
+            tracing::warn!(%error, trace_id = %trace_id, "Failed to write request log entry");
+        }
 }
 
 /// Provider attribution for a failed decision call, mirroring
@@ -544,12 +545,13 @@ fn log_decision_attempts(state: &AppState, trace_id: &str, attempts: &[ProviderA
             prompt_label: None,
                 error_class: Some(
                     attempt
-                        .error_class
-                        .clone()
-                        .unwrap_or_else(|| "other".to_string()),
-                ),
-                output_cap_metadata: None,
-            };
+                .error_class
+                .clone()
+                .unwrap_or_else(|| "other".to_string()),
+        ),
+        output_cap_metadata: None,
+        client_tool: None,
+    };
         if let Err(error) = state.logger.log(entry) {
             tracing::warn!(
                 error = %error,

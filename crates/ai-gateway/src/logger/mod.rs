@@ -309,11 +309,20 @@ pub struct LogEntry {
 /// point-in-time snapshot, not a join key.
 #[serde(default, skip_serializing_if = "Option::is_none")]
 pub prompt_label: Option<String>,
-/// Content-free metadata describing output cap application when a cap
-/// was applied (response-output-caps spec, Task 5). Contains `applied_value`
-/// and `originals` fields without response content.
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub output_cap_metadata: Option<serde_json::Value>,
+    /// Content-free metadata describing output cap application when a cap
+    /// was applied (response-output-caps spec, Task 5). Contains `applied_value`
+    /// and `originals` fields without response content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cap_metadata: Option<serde_json::Value>,
+    /// Canonical coding-tool attribution token (`claude-code`, `codex`,
+    /// `cursor`, `gemini-cli`, `qwen-code`, `roo-code`, `opencode`,
+    /// `unattributed`) computed once from the original client request's
+    /// headers (per-seat-coding-tool-spend-views spec, Req 1.1/1.8).
+    /// Never the raw User-Agent string. Rows written before the column
+    /// existed read back as NULL; report readers normalize NULL to
+    /// `unattributed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_tool: Option<String>,
 }
 
 impl LogEntry {
@@ -424,6 +433,11 @@ pub struct LogFilter {
     pub client_protocol: Option<String>,
     /// Exact-match Claude session/agent identifier filter (Req 5.5).
     pub claude_session_id: Option<String>,
+    /// Exact-match coding-tool attribution filter
+    /// (per-seat-coding-tool-spend-views spec, Req 5.1). Canonical token
+    /// (`claude-code`, `codex`, ...) or `unattributed`; the comparison
+    /// normalizes NULL/blank to `unattributed` so legacy rows match.
+    pub client_tool: Option<String>,
     /// Exact-match prompt-library id filter (prompt-library-versioning
     /// spec, Req 4.4). Rows written before prompt attribution (and all
     /// ordinary calls) have a NULL `prompt_id` and never match, per SQL
@@ -606,10 +620,12 @@ impl RequestLogger {
     input_tokens INTEGER,
     output_tokens INTEGER,
     key_id TEXT,
-    prompt_id TEXT,
-    prompt_version INTEGER,
-    prompt_label TEXT
-)",
+            prompt_id TEXT,
+            prompt_version INTEGER,
+            prompt_label TEXT,
+            output_cap_metadata TEXT,
+            client_tool TEXT
+        )",
             [],
         )?;
 
@@ -636,7 +652,8 @@ impl RequestLogger {
         Self::ensure_column(conn, "prompt_id", "TEXT")?;
         Self::ensure_column(conn, "prompt_version", "INTEGER")?;
         Self::ensure_column(conn, "prompt_label", "TEXT")?;
-    Self::ensure_column(conn, "output_cap_metadata", "TEXT")?;
+        Self::ensure_column(conn, "output_cap_metadata", "TEXT")?;
+        Self::ensure_column(conn, "client_tool", "TEXT")?;
 
         // Create indexes for common query patterns
         conn.execute(
@@ -1087,14 +1104,14 @@ memories_injected, memories_stored, injection_tokens, detected_project,
 cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash,
 reasoning_tokens, reasoning_compat_actions, error_class, reasoning_relayed_frames,
 context_reduction, client_protocol, claude_session_id,
-input_tokens, output_tokens, key_id,
-prompt_id, prompt_version, prompt_label, output_cap_metadata
-) VALUES (
-?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
-?29, ?30, ?31, ?32, ?33,
-?34, ?35, ?36, ?37
-)",
+            input_tokens, output_tokens, key_id,
+            prompt_id, prompt_version, prompt_label, output_cap_metadata, client_tool
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+            ?29, ?30, ?31, ?32, ?33,
+            ?34, ?35, ?36, ?37, ?38
+        )",
         params![
             entry.trace_id,
             entry.timestamp.timestamp(),
@@ -1133,6 +1150,7 @@ entry.input_tokens,
             entry.prompt_version,
             entry.prompt_label,
             entry.output_cap_metadata.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()),
+            entry.client_tool.clone(),
         ],
     )?;
 
@@ -1141,7 +1159,7 @@ entry.input_tokens,
 
 /// Query log entries with optional filtering. Runs on the writer thread.
 fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
-    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id, input_tokens, output_tokens, key_id, prompt_id, prompt_version, prompt_label, output_cap_metadata FROM requests WHERE 1=1");
+    let mut query = String::from("SELECT trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, request_body, response_body, requested_model, responded_model, compression_metadata, memories_injected, memories_stored, injection_tokens, detected_project, cache_read_tokens, cache_creation_tokens, cache_savings_cents, prefix_hash, reasoning_tokens, reasoning_compat_actions, error_class, context_reduction, client_protocol, claude_session_id, input_tokens, output_tokens, key_id, prompt_id, prompt_version, prompt_label, output_cap_metadata, client_tool FROM requests WHERE 1=1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
     if let Some(ref trace_id) = filter.trace_id {
@@ -1192,6 +1210,17 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
     if let Some(ref claude_session_id) = filter.claude_session_id {
         query.push_str(" AND claude_session_id = ?");
         params.push(Box::new(claude_session_id.clone()));
+    }
+
+    if let Some(ref client_tool) = filter.client_tool {
+        if client_tool == "unattributed" {
+            query.push_str(
+                " AND COALESCE(NULLIF(TRIM(CAST(client_tool AS TEXT)), ''), 'unattributed') = 'unattributed'",
+            );
+        } else {
+            query.push_str(" AND client_tool = ?");
+            params.push(Box::new(client_tool.clone()));
+        }
     }
 
     if let Some(ref prompt_id) = filter.prompt_id {
@@ -1263,6 +1292,7 @@ fn run_query(conn: &Connection, filter: &LogFilter) -> Result<Vec<LogEntry>> {
             prompt_label: row.get(33)?,
             output_cap_metadata: row.get::<_, Option<String>>(34)?
                 .and_then(|s| serde_json::from_str(&s).ok()),
+            client_tool: row.get(35)?,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1377,6 +1407,7 @@ input_tokens: None,
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         }
     }
 
@@ -1612,9 +1643,96 @@ fn usage_and_key_columns_round_trip_and_default_null() {
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap();
-    assert!(columns.contains(&"input_tokens".to_owned()));
-    assert!(columns.contains(&"output_tokens".to_owned()));
-    assert!(columns.contains(&"key_id".to_owned()));
+assert!(columns.contains(&"input_tokens".to_owned()));
+assert!(columns.contains(&"output_tokens".to_owned()));
+assert!(columns.contains(&"key_id".to_owned()));
+}
+
+/// Coding-tool attribution persistence (per-seat-coding-tool-spend-views
+/// spec, Req 1.1/1.2): a seeded canonical token round-trips through the
+/// requests table. Handlers persist the canonical token including
+/// `unattributed` when no signature matches; read paths additionally
+/// normalize NULL (legacy rows) to `unattributed`. The API payload omits
+/// the field when unset.
+#[test]
+fn client_tool_round_trips_and_defaults_null() {
+let (logger, temp) = create_test_logger();
+
+let mut attributed = sample_entry("tool-attributed", None);
+attributed.client_tool = Some("claude-code".to_owned());
+logger.log(attributed).unwrap();
+
+let plain = sample_entry("tool-unknown", None);
+logger.log(plain).unwrap();
+logger.flush();
+drop(logger);
+
+let logger = RequestLogger::new(LoggingConfig {
+database_path: temp.path().to_string_lossy().into_owned(),
+..Default::default()
+})
+.unwrap();
+let attributed = logger
+.query(LogFilter {
+trace_id: Some("tool-attributed".to_owned()),
+..Default::default()
+})
+.unwrap();
+assert_eq!(attributed.len(), 1);
+assert_eq!(attributed[0].client_tool.as_deref(), Some("claude-code"));
+
+let unknown = logger
+.query(LogFilter {
+trace_id: Some("tool-unknown".to_owned()),
+..Default::default()
+})
+.unwrap();
+assert_eq!(unknown.len(), 1);
+assert!(unknown[0].client_tool.is_none());
+
+    let json = serde_json::to_value(&unknown[0]).unwrap();
+    assert!(json.get("client_tool").is_none());
+}
+
+/// Coding-tool log filter (per-seat-coding-tool-spend-views spec,
+/// Req 5.1): exact canonical-token match; `unattributed` matches NULL
+/// (legacy) rows via the normalized comparison, and a token filter
+/// never matches NULL rows.
+#[test]
+fn client_tool_filter_matches_token_and_unattributed() {
+    let (logger, _temp) = create_test_logger();
+
+    let mut attributed = sample_entry("tool-filter-attributed", None);
+    attributed.client_tool = Some("claude-code".to_owned());
+    logger.log(attributed).unwrap();
+    logger.log(sample_entry("tool-filter-legacy", None)).unwrap();
+    logger.flush();
+
+    let claude_rows = logger
+        .query(LogFilter {
+            client_tool: Some("claude-code".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(claude_rows.len(), 1);
+    assert_eq!(claude_rows[0].trace_id, "tool-filter-attributed");
+
+    let unattributed_rows = logger
+        .query(LogFilter {
+            client_tool: Some("unattributed".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(unattributed_rows.len(), 1);
+    assert_eq!(unattributed_rows[0].trace_id, "tool-filter-legacy");
+
+    let codex_rows = logger
+        .query(LogFilter {
+            client_tool: Some("codex".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(codex_rows.is_empty());
 }
 
 /// Cost-reporting usage enrichment: a pre-enrichment database gains the
@@ -2721,6 +2839,7 @@ fn logs_query_filters_by_prompt_attribution() {
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         };
 
         logger.log(entry.clone()).unwrap();
@@ -2906,6 +3025,7 @@ fn logs_query_filters_by_prompt_attribution() {
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         };
 
         logger.log(old_entry).unwrap();
@@ -2947,9 +3067,10 @@ fn logs_query_filters_by_prompt_attribution() {
         prompt_version: None,
         prompt_label: None,
         output_cap_metadata: None,
+        client_tool: None,
     };
 
-    logger.log(recent_entry).unwrap();
+logger.log(recent_entry).unwrap();
 
         // Cleanup should remove the old entry
         let deleted = logger.cleanup_old_logs().unwrap();
@@ -3038,8 +3159,9 @@ mod property_tests {
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         }
-    },
+        },
     )
 }
 
@@ -3147,13 +3269,14 @@ mod property_tests {
             virtual_key_id: None,
         prompt_id: None,
         prompt_version: None,
-        prompt_label: None,
-        output_cap_metadata: None,
-    };
+ prompt_label: None,
+ output_cap_metadata: None,
+ client_tool: None,
+ };
 
-            logger.log(entry.clone()).unwrap();
+logger.log(entry.clone()).unwrap();
 
-            // Run cleanup
+// Run cleanup
             let deleted = logger.cleanup_old_logs().unwrap();
 
             // Verify cleanup behavior
@@ -3234,13 +3357,14 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        output_cap_metadata: None,
-    };
+ output_cap_metadata: None,
+ client_tool: None,
+ };
 
-            logger.log(entry).unwrap();
+logger.log(entry).unwrap();
 
-            let results = logger.query(LogFilter {
-                trace_id: Some("test-size".to_string()),
+let results = logger.query(LogFilter {
+trace_id: Some("test-size".to_string()),
                 ..Default::default()
             }).unwrap();
 
@@ -3317,13 +3441,14 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        output_cap_metadata: None,
-    };
+ output_cap_metadata: None,
+ client_tool: None,
+ };
 
-            logger.log(entry).unwrap();
+logger.log(entry).unwrap();
 
-            let results = logger.query(LogFilter {
-                trace_id: Some("test-exclusion".to_string()),
+let results = logger.query(LogFilter {
+trace_id: Some("test-exclusion".to_string()),
                 ..Default::default()
             }).unwrap();
 
@@ -3398,13 +3523,14 @@ mod property_tests {
         prompt_id: None,
         prompt_version: None,
         prompt_label: None,
-        output_cap_metadata: None,
-    };
+ output_cap_metadata: None,
+ client_tool: None,
+ };
 
-            logger.log(entry).unwrap();
+logger.log(entry).unwrap();
 
-            let results = logger.query(LogFilter {
-                trace_id: Some("test-redaction".to_string()),
+let results = logger.query(LogFilter {
+trace_id: Some("test-redaction".to_string()),
                 ..Default::default()
             }).unwrap();
 
@@ -3487,14 +3613,15 @@ mod property_tests {
             virtual_key_id: None,
         prompt_id: None,
         prompt_version: None,
-        prompt_label: None,
-        output_cap_metadata: None,
-    };
+ prompt_label: None,
+ output_cap_metadata: None,
+ client_tool: None,
+ };
 
-            logger.log(entry).unwrap();
+logger.log(entry).unwrap();
 
-            let results = logger.query(LogFilter {
-                trace_id: Some(trace_id.clone()),
+let results = logger.query(LogFilter {
+trace_id: Some(trace_id.clone()),
                 ..Default::default()
             }).unwrap();
 

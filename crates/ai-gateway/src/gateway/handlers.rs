@@ -171,6 +171,11 @@ completion_text: Option<String>,
     /// Content-free output cap application metadata when a cap was applied
     /// (response-output-caps spec, Task 5).
     output_cap_metadata: Option<serde_json::Value>,
+    /// Canonical coding-tool attribution token computed once from the
+    /// original client request's headers at the front door
+    /// (per-seat-coding-tool-spend-views spec, Req 1.1/1.5): the outcome
+    /// row and every drained attempt row inherit the same value.
+    client_tool: Option<String>,
 }
 
 impl RequestLogContext {
@@ -393,6 +398,7 @@ fn with_prompt_meta(mut self, meta: Option<&PromptResolutionMeta>) -> Self {
         prompt_version: None,
         prompt_label: None,
         output_cap_metadata: crate::router::router::current_request_output_cap_metadata(),
+        client_tool: None,
     }
 }
 
@@ -444,6 +450,7 @@ fn from_streaming_success(
         prompt_version: None,
         prompt_label: None,
         output_cap_metadata: crate::router::router::current_request_output_cap_metadata(),
+        client_tool: None,
     }
 }
 
@@ -512,18 +519,27 @@ fn from_error(
         prompt_version: None,
         prompt_label: None,
         output_cap_metadata: crate::router::router::current_request_output_cap_metadata(),
+        client_tool: None,
     }
 }
 
 /// Tag this log context as originating from the Anthropic Messages
     /// front door (`/v1/messages`): sets `client_protocol = "anthropic"`
     /// and records the Claude Code session/agent id (Req 5.5, 6.3).
-    fn with_anthropic_protocol(mut self, claude_session_id: Option<String>) -> Self {
-        self.client_protocol = Some("anthropic");
-        self.claude_session_id = claude_session_id;
-        self.log_path = "/v1/messages";
-        self
-    }
+fn with_anthropic_protocol(mut self, claude_session_id: Option<String>) -> Self {
+    self.client_protocol = Some("anthropic");
+    self.claude_session_id = claude_session_id;
+    self.log_path = "/v1/messages";
+    self
+}
+
+/// Attach the coding-tool attribution token computed at the front
+/// door (per-seat-coding-tool-spend-views spec, Req 1.1/1.5) so the
+/// outcome row and every drained attempt row carry the same value.
+fn with_client_tool(mut self, client_tool: Option<String>) -> Self {
+    self.client_tool = client_tool;
+    self
+}
 }
 
 /// Write the terminal outcome row for a chat request: first drain the
@@ -570,7 +586,13 @@ fn log_outcome_with_emission(
         if state.telemetry_snapshot.enabled() {
             telemetry_attempts = attempts.clone();
         }
-        log_failed_attempts(&state.logger, &state.metrics, &context.trace_id, &attempts);
+        log_failed_attempts(
+            &state.logger,
+            &state.metrics,
+            &context.trace_id,
+            &attempts,
+            context.client_tool.as_deref(),
+        );
     }
     let relay = handle.and_then(|handle| handle.reasoning_relay());
     let key = handle.and_then(|handle| {
@@ -805,6 +827,7 @@ fn write_request_log(
         prompt_version: context.prompt_version,
         prompt_label: context.prompt_label.clone(),
         output_cap_metadata: context.output_cap_metadata.clone(),
+        client_tool: context.client_tool.clone(),
     };
     logger.log_with_reasoning_relay(entry, context.reasoning_relayed_frames)
 }
@@ -845,6 +868,7 @@ fn log_failed_attempts(
     metrics: &Metrics,
     trace_id: &str,
     attempts: &[ProviderAttempt],
+    client_tool: Option<&str>,
 ) {
     for attempt in attempts {
         let status_code = attempt.status_code.unwrap_or(ATTEMPT_FALLBACK_STATUS);
@@ -893,6 +917,7 @@ fn log_failed_attempts(
                         .unwrap_or_else(|| "other".to_string()),
                 ),
                 output_cap_metadata: None,
+                client_tool: client_tool.map(str::to_string),
             };
         if let Err(e) = logger.log(entry) {
             tracing::warn!(
@@ -1733,11 +1758,13 @@ fn guardrail_error_response(
     request: &OpenAIRequest,
     request_guard: &mut RequestCompleteGuard,
     trace_id: &str,
+    client_tool: Option<String>,
     error: GatewayError,
 ) -> Response {
     let duration_ms = request_guard.complete();
     let log_context =
-        RequestLogContext::from_error(request, trace_id.to_string(), duration_ms, &error);
+        RequestLogContext::from_error(request, trace_id.to_string(), duration_ms, &error)
+            .with_client_tool(client_tool);
     log_outcome_with_emission(
         state,
         request,
@@ -1963,6 +1990,10 @@ struct AbandonLogger {
     /// `client_protocol` for the 499/504 outcome row (`None` for client
     /// requests; the request origin's log protocol for internal ones).
     client_protocol: Option<&'static str>,
+    /// Coding-tool attribution for the 499/504 outcome row and its
+    /// drained attempt rows (per-seat-coding-tool-spend-views spec,
+    /// Req 1.1/1.5).
+    client_tool: Option<String>,
 }
 
 impl AbandonLogger {
@@ -1994,12 +2025,20 @@ impl AbandonLogger {
             deadline_secs,
             prompt_meta: None,
             client_protocol: None,
+            client_tool: None,
         }
     }
 
     /// Set the `client_protocol` written on the abandoned-request row.
     fn with_client_protocol(mut self, protocol: Option<&'static str>) -> Self {
         self.client_protocol = protocol;
+        self
+    }
+
+    /// Attach the coding-tool attribution token (Req 1.1/1.5) so the
+    /// abandoned row and its attempt rows carry the client identity.
+    fn with_client_tool(mut self, client_tool: Option<String>) -> Self {
+        self.client_tool = client_tool;
         self
     }
 
@@ -2055,7 +2094,13 @@ impl AbandonLogger {
             phase.label(),
         );
         let attempts = self.handle.take_failed_attempts();
-        log_failed_attempts(&self.logger, metrics, &trace_id, &attempts);
+        log_failed_attempts(
+            &self.logger,
+            metrics,
+            &trace_id,
+            &attempts,
+            self.client_tool.as_deref(),
+        );
         let entry = LogEntry {
             trace_id: trace_id.clone(),
             timestamp: chrono::Utc::now(),
@@ -2103,6 +2148,7 @@ impl AbandonLogger {
             .and_then(|meta| meta.prompt_label.clone()),
                 error_class: Some(error_class.to_string()),
                 output_cap_metadata: None,
+                client_tool: self.client_tool.clone(),
             };
         tracing::info!(
             trace_id = %trace_id,
@@ -2712,6 +2758,9 @@ pub(crate) async fn dispatch_internal_chat(
         &ctx.metrics,
         &trace_id,
         &handle.take_failed_attempts(),
+        // Internal dispatches have no client headers; internal rows stay
+        // unattributed in the ledger.
+        None,
     );
     if let Err(error) = write_request_log(&ctx.logger, &request, &log_context) {
         tracing::warn!(%error, trace_id = %trace_id, "Failed to write internal request log entry");
@@ -3021,6 +3070,11 @@ pub async fn chat_completions(
     // telemetry is enabled; invalid values are ignored above.
     let inbound_telemetry =
             super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
+        // Coding-tool attribution (per-seat-coding-tool-spend-views spec,
+        // Req 1.1/1.5): computed once from the ORIGINAL client headers
+        // before any dispatch so the outcome row, attempt rows, and the
+        // abandon row all share the same token.
+        let client_tool = Some(crate::client_tool::classify(&headers).as_str().to_string());
         RequestOutputCapScope::new(output_cap_applied_value)
             .with_metadata(output_cap_metadata)
             .scope(async {
@@ -3035,6 +3089,7 @@ pub async fn chat_completions(
                     compression_restore,
                     inbound_telemetry,
                     prompt_meta,
+                    client_tool,
                 )
                 .await
             } else {
@@ -3048,6 +3103,7 @@ pub async fn chat_completions(
                     compression_restore,
                     inbound_telemetry,
                     prompt_meta,
+                    client_tool,
                 )
                 .await
             }
@@ -3066,6 +3122,7 @@ async fn chat_completions_non_stream(
     compression_restore: crate::router::router::ToolCompressionRestore,
     inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
     prompt_meta: Option<PromptResolutionMeta>,
+    client_tool: Option<String>,
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -3090,7 +3147,9 @@ async fn chat_completions_non_stream(
         Some((state.active_requests.clone(), trace_id.clone())),
     )
     .with_abandon_logger(
-        AbandonLogger::new(&state, &active_handle).with_prompt_meta(prompt_meta.clone()),
+        AbandonLogger::new(&state, &active_handle)
+            .with_prompt_meta(prompt_meta.clone())
+            .with_client_tool(client_tool.clone()),
     )
     .with_prompt_meta(prompt_meta.clone())
     .with_inbound_telemetry(inbound_telemetry.clone())
@@ -3221,6 +3280,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                 &request,
                 &mut request_guard,
                 &trace_id,
+                client_tool.clone(),
                 err,
             );
         }
@@ -3231,6 +3291,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                 &request,
                 &mut request_guard,
                 &trace_id,
+                client_tool.clone(),
                 GatewayError::GuardrailInvalidAction,
             );
         }
@@ -3242,6 +3303,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                 &request,
                 &mut request_guard,
                 &trace_id,
+                client_tool.clone(),
                 err,
             );
         }
@@ -3254,6 +3316,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                 &request,
                 &mut request_guard,
                 &trace_id,
+                client_tool.clone(),
                 err,
             );
         }
@@ -3376,6 +3439,7 @@ match engine
             &response,
         )
         .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+        .with_client_tool(client_tool.clone())
         .with_memory(
             memory_context
                 .as_ref()
@@ -3489,6 +3553,7 @@ match engine
                                                 &request,
                                                 &mut request_guard,
                                                 &trace_id,
+                                                client_tool.clone(),
                                                 err,
                                             );
                                         }
@@ -3501,6 +3566,7 @@ match engine
                                                 &request,
                                                 &mut request_guard,
                                                 &trace_id,
+                                                client_tool.clone(),
                                                 err,
                                             );
                                         }
@@ -3552,6 +3618,7 @@ match engine
                             &request,
                             &mut request_guard,
                             &trace_id,
+                            client_tool.clone(),
                             err,
                         );
                     }
@@ -3565,6 +3632,7 @@ match engine
                             &request,
                             &mut request_guard,
                             &trace_id,
+                            client_tool.clone(),
                             err,
                         );
                     }
@@ -3718,6 +3786,7 @@ match engine
                                                                 &request,
                                                                 &mut request_guard,
                                                                 &trace_id,
+                                                                client_tool.clone(),
                                                                 GatewayError::GuardrailPolicyViolation {
                                                                     category: block.entity_label,
                                                                 },
@@ -3729,6 +3798,7 @@ match engine
                                                                 &request,
                                                                 &mut request_guard,
                                                                 &trace_id,
+                                                                client_tool.clone(),
                                                                 GatewayError::GuardrailUnavailable(
                                                                     "guardrail service unavailable"
                                                                         .to_owned(),
@@ -3921,6 +3991,7 @@ match engine
             &response,
         )
         .with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+        .with_client_tool(client_tool.clone())
         .with_memory(
                 memory_context
                     .as_ref()
@@ -3953,11 +4024,12 @@ match engine
 Err(e) => {
     let duration_ms = request_guard.complete();
     let log_context =
-        RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-    log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry(), request_guard.prompt_meta());
-    let mut response = e.into_response();
-    attach_trace_id_header(&mut response, &trace_id);
-    // Error path: every failed upstream send is already a ledger row,
+RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e)
+.with_client_tool(client_tool.clone());
+log_outcome(&state, &request, &log_context, request_guard.active_handle(), request_guard.inbound_telemetry(), request_guard.prompt_meta());
+let mut response = e.into_response();
+attach_trace_id_header(&mut response, &trace_id);
+// Error path: every failed upstream send is already a ledger row,
     // so the count is the row total as-is (Req 5.3).
     insert_attempt_count_header(
         &mut response,
@@ -3982,6 +4054,7 @@ async fn chat_completions_stream(
     compression_restore: crate::router::router::ToolCompressionRestore,
     inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
     prompt_meta: Option<PromptResolutionMeta>,
+    client_tool: Option<String>,
 ) -> Response {
     state.metrics.start_request();
     let start = Instant::now();
@@ -4006,7 +4079,9 @@ async fn chat_completions_stream(
         Some((state.active_requests.clone(), trace_id.clone())),
     )
     .with_abandon_logger(
-        AbandonLogger::new(&state, &active_handle).with_prompt_meta(prompt_meta.clone()),
+        AbandonLogger::new(&state, &active_handle)
+            .with_prompt_meta(prompt_meta.clone())
+            .with_client_tool(client_tool.clone()),
     )
     .with_prompt_meta(prompt_meta.clone())
     .with_inbound_telemetry(inbound_telemetry.clone())
@@ -4142,6 +4217,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &request,
                     &mut request_guard,
                     &trace_id,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -4151,6 +4227,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &request,
                     &mut request_guard,
                     &trace_id,
+                    client_tool.clone(),
                     GatewayError::GuardrailInvalidAction,
                 );
             }
@@ -4161,6 +4238,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &request,
                     &mut request_guard,
                     &trace_id,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -4172,6 +4250,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &request,
                     &mut request_guard,
                     &trace_id,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -4210,6 +4289,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                 request_guard,
                 Some(active_handle.clone()),
                 compression_restore,
+                client_tool,
             )
             .await;
         }
@@ -4233,6 +4313,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
             request_guard,
             Some(active_handle.clone()),
             compression_restore,
+            client_tool,
         )
         .await;
     }
@@ -4257,6 +4338,7 @@ let active_handle_stream = active_handle.clone();
 // Header-time attempt-count snapshot: taken before the handle moves
 // into the stream generator (headers commit before routing runs).
 let early_attempt_rows = active_handle.attempt_rows_total();
+let stream_client_tool = client_tool.clone();
 
         let streaming_config_relay = streaming_config.clone();
         let stream = async_stream::stream! {
@@ -4446,7 +4528,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
 
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(client_tool.clone());
                     log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
 
                                     // Non-blocking memory extraction now that the full
@@ -4585,7 +4668,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                 AggregatedError::new(std::mem::take(&mut streaming_attempts)),
                                             );
                                             let duration_ms = start.elapsed().as_millis() as u64;
-                                            let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+                                            let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated)
+.with_client_tool(stream_client_tool.clone());
                                             log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                             let (error_type, message) = classify_stream_error(&aggregated);
                                             for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
@@ -4689,7 +4773,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                     current_compression.clone(),
                                 )
                                 .with_cost(cost)
-                                .with_usage(usage.prompt_tokens, usage.completion_tokens);
+                                .with_usage(usage.prompt_tokens, usage.completion_tokens)
+                                .with_client_tool(stream_client_tool.clone());
                                 // Streaming attempts that failed before this success are
                                 // in the ledger; log_outcome writes them as #attempt rows.
                                 log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
@@ -4709,7 +4794,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                     current_provider.clone(),
                                                     current_model.clone(),
                                                     current_compression.clone(),
-                                                );
+                                                )
+                                                .with_client_tool(stream_client_tool.clone());
                                                 active_handle_stream.record_failed_attempt(relay_failure_attempt(
                                                     &current_provider,
                                                     &current_model,
@@ -4818,7 +4904,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                             }
                                                             let duration_ms = start.elapsed().as_millis() as u64;
                                                             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(client_tool.clone());
                                                             log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                                             if let Some(memory) = memory_context.as_ref() {
                                                                 let response_content = response
@@ -4854,7 +4941,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
         e,
         );
         let duration_ms = start.elapsed().as_millis() as u64;
-        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated)
+.with_client_tool(stream_client_tool.clone());
         log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
         let (error_type, message) = classify_stream_error(&aggregated);
         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
@@ -4916,7 +5004,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                         }
                                                         let duration_ms = start.elapsed().as_millis() as u64;
                                                         let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(client_tool.clone());
                                                         log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                                         if let Some(memory) = memory_context.as_ref() {
                                                             let response_content = response
@@ -4958,7 +5047,8 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                                             e,
                                                         );
                                                         let duration_ms = start.elapsed().as_millis() as u64;
-                                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated);
+                                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &aggregated)
+.with_client_tool(stream_client_tool.clone());
                                                         log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                                         let (error_type, message) = classify_stream_error(&aggregated);
                                                         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
@@ -4977,8 +5067,9 @@ let early_attempt_rows = active_handle.attempt_rows_total();
                                     // graceful SSE error event so the client always gets a reason
                                     // before the stream terminates (Req 5.1, 5.2, 5.4).
                                     let duration_ms = start.elapsed().as_millis() as u64;
-                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
-                                    log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
+                                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e)
+.with_client_tool(client_tool.clone());
+log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
 
                                     // Map the error variant to an SSE error frame. emit_sse_error_event
                                     // already appends [DONE], so we must NOT yield a separate one.
@@ -5048,19 +5139,20 @@ return sse;
             Ok(resp) => resp,
             Err(e) => {
                 let duration_ms = request_guard.complete();
-                let log_context =
-                    RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-                log_outcome(
-                    &state,
-                    &request,
-                    &log_context,
-                    request_guard.active_handle(),
-                    request_guard.inbound_telemetry(),
-                request_guard.prompt_meta(),
-                );
-    let mut response = e.into_response();
-    attach_trace_id_header(&mut response, &trace_id);
-    // Pre-stream routing error (relay disabled): headers emit after
+let log_context =
+RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e)
+.with_client_tool(client_tool.clone());
+log_outcome(
+&state,
+&request,
+&log_context,
+request_guard.active_handle(),
+request_guard.inbound_telemetry(),
+request_guard.prompt_meta(),
+);
+let mut response = e.into_response();
+attach_trace_id_header(&mut response, &trace_id);
+// Pre-stream routing error (relay disabled): headers emit after
     // routing resolved, so the count is the full ledger total.
     insert_attempt_count_header(
         &mut response,
@@ -5078,6 +5170,7 @@ return sse;
         let requested_model = request.model.clone();
         let stream_trace_id = trace_id.clone();
         let active_handle_stream = active_handle.clone();
+        let stream_client_tool = client_tool.clone();
         let streaming_config_relay = streaming_config.clone();
 
         enum RelayStep {
@@ -5150,19 +5243,20 @@ let first_step = loop {
         let first_step = match first_step {
             RelayStep::Routing(Err(e)) => {
                 let duration_ms = request_guard.complete();
-                let log_context =
-                    RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e);
-                log_outcome(
-                    &state,
-                    &request,
-                    &log_context,
-                    request_guard.active_handle(),
-                    request_guard.inbound_telemetry(),
-                request_guard.prompt_meta(),
-                );
-            let mut response = e.into_response();
-            attach_trace_id_header(&mut response, &trace_id);
-            // First-step routing error (relay enabled): headers emit after
+let log_context =
+RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &e)
+.with_client_tool(client_tool.clone());
+log_outcome(
+&state,
+&request,
+&log_context,
+request_guard.active_handle(),
+request_guard.inbound_telemetry(),
+request_guard.prompt_meta(),
+);
+let mut response = e.into_response();
+attach_trace_id_header(&mut response, &trace_id);
+// First-step routing error (relay enabled): headers emit after
             // routing resolved, so the count is the full ledger total.
             insert_attempt_count_header(
                 &mut response,
@@ -5317,7 +5411,8 @@ stream_trace_id.clone(),
 duration_ms,
 &response,
 )
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(stream_client_tool.clone());
 log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
 
 // Non-blocking memory extraction now that the full
@@ -5372,7 +5467,8 @@ log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbou
                             stream_trace_id.clone(),
                             duration_ms,
                             &e,
-                        );
+                        )
+                            .with_client_tool(stream_client_tool.clone());
                         log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                         let (error_type, message) = classify_stream_error(&e);
                         for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
@@ -5413,7 +5509,8 @@ log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbou
     let duration_ms = start.elapsed().as_millis() as u64;
     let log_context =
 RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(client_tool.clone());
 log_outcome(
 &state,
 &request,
@@ -5973,6 +6070,7 @@ async fn stream_eager_structured_output(
     mut request_guard: RequestCompleteGuard,
     active: Option<crate::active_requests::ActiveRequestHandle>,
     compression_restore: crate::router::router::ToolCompressionRestore,
+    client_tool: Option<String>,
 ) -> Response {
     let mut response = match state
         .router
@@ -6013,7 +6111,8 @@ async fn stream_eager_structured_output(
                             trace_id.clone(),
                             duration_ms,
                             &error,
-                        );
+                        )
+                            .with_client_tool(client_tool.clone());
                         log_outcome(
                             &state,
                             &request,
@@ -6044,7 +6143,8 @@ async fn stream_eager_structured_output(
                             trace_id.clone(),
                             duration_ms,
                             &gateway_error,
-                        );
+                        )
+                            .with_client_tool(client_tool.clone());
                         log_outcome(
                             &state,
                             &request,
@@ -6083,7 +6183,8 @@ async fn stream_eager_structured_output(
                         trace_id.clone(),
                         duration_ms,
                         &gateway_error,
-                    );
+                    )
+                        .with_client_tool(client_tool.clone());
                     log_outcome(
                         &state,
                         &request,
@@ -6114,7 +6215,8 @@ if !assembled.complete {
                     trace_id.clone(),
                     duration_ms,
                     &gateway_error,
-                );
+                )
+                    .with_client_tool(client_tool.clone());
                 log_outcome(
                     &state,
                     &request,
@@ -6163,7 +6265,8 @@ if !assembled.complete {
         Err(error) => {
             let duration_ms = request_guard.complete();
             let log_context =
-                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error)
+.with_client_tool(client_tool.clone());
             log_outcome(
                 &state,
                 &request,
@@ -6204,7 +6307,8 @@ if !assembled.complete {
         EagerPostCallResult::Terminal { events, error } => {
             let duration_ms = request_guard.complete();
             let log_context =
-                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error)
+.with_client_tool(client_tool.clone());
             log_outcome(
                 &state,
                 &request,
@@ -6245,7 +6349,8 @@ if !assembled.complete {
         Err(EagerPostCallResult::Terminal { events, error }) => {
             let duration_ms = request_guard.complete();
             let log_context =
-                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error);
+                RequestLogContext::from_error(&request, trace_id.clone(), duration_ms, &error)
+.with_client_tool(client_tool.clone());
             log_outcome(
                 &state,
                 &request,
@@ -6293,7 +6398,8 @@ Err(EagerPostCallResult::Response(_)) => unreachable!(),
     let duration_ms = request_guard.complete();
     let log_context =
 RequestLogContext::from_response(&request, trace_id.clone(), duration_ms, &response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(client_tool.clone());
     log_outcome(
         &state,
         &request,
@@ -6347,6 +6453,7 @@ async fn stream_buffered_with_post_call(
     request_guard: RequestCompleteGuard,
     active: Option<crate::active_requests::ActiveRequestHandle>,
     compression_restore: crate::router::router::ToolCompressionRestore,
+    client_tool: Option<String>,
 ) -> Response {
     let emit_early = streaming_config.emit_early_event;
     // Task 7 — buffered reasoning progress relay (Component 4, site 3):
@@ -6642,7 +6749,8 @@ async fn stream_buffered_with_post_call(
                         );
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let err = GatewayError::GuardrailUnavailable(msg.clone());
-                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err)
+            .with_client_tool(client_tool.clone());
                         log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                         for event in emit_sse_error_event("guardrail_buffer_overflow", &msg, &stream_trace_id) {
                             yield Ok(event);
@@ -6668,7 +6776,8 @@ assembled = Some(a.response);
                 Err(e) => {
                     // Routing failed before any streaming — graceful SSE error frame.
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e);
+                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &e)
+.with_client_tool(client_tool.clone());
                     log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     let (error_type, message) = classify_stream_error(&e);
                     for event in emit_sse_error_event(error_type, &message, &stream_trace_id) {
@@ -6685,7 +6794,8 @@ assembled = Some(a.response);
                 let msg = "Upstream stream ended before a complete response; guardrail failure policy is fail-close".to_string();
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let err = GatewayError::GuardrailUnavailable(msg.clone());
-                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err)
+            .with_client_tool(client_tool.clone());
                 log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                 for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                     yield Ok(event);
@@ -6767,7 +6877,8 @@ assembled = Some(a.response);
     }
     let duration_ms = start.elapsed().as_millis() as u64;
     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(client_tool.clone());
     log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
     for chunk in chunks {
         yield Ok(Event::default().data(chunk.to_string()));
@@ -6802,7 +6913,8 @@ assembled = Some(a.response);
             }
             let duration_ms = start.elapsed().as_millis() as u64;
             let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &response))
+.with_client_tool(client_tool.clone());
             log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
             for chunk in chunks {
                 yield Ok(Event::default().data(chunk.to_string()));
@@ -6880,7 +6992,8 @@ assembled = Some(a.response);
                                         let payload = guardrail_stream::block_frame_payload(&block.entity_label);
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
-                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err)
+            .with_client_tool(client_tool.clone());
                                         log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                         yield Ok(Event::default().data(payload.to_string()));
                                         yield Ok(Event::default().data("[DONE]"));
@@ -6891,7 +7004,8 @@ assembled = Some(a.response);
                                         let msg = "guardrail service unavailable".to_string();
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let err = GatewayError::GuardrailUnavailable(msg.clone());
-                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                                        let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err)
+            .with_client_tool(client_tool.clone());
                                         log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                                         for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                                             yield Ok(event);
@@ -6955,7 +7069,8 @@ assembled = Some(a.response);
         }
         let duration_ms = start.elapsed().as_millis() as u64;
                     let log_context = RequestLogContext::from_response(&request, stream_trace_id.clone(), duration_ms, &last_response)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &last_response));
+.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &last_response))
+.with_client_tool(client_tool.clone());
                     log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     for chunk in chunks {
                         yield Ok(Event::default().data(chunk.to_string()));
@@ -6967,7 +7082,8 @@ assembled = Some(a.response);
                     let payload = guardrail_stream::block_frame_payload(&block.entity_label);
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailPolicyViolation { category: block.entity_label.clone() };
-                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err)
+            .with_client_tool(client_tool.clone());
                     log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     yield Ok(Event::default().data(payload.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
@@ -6977,7 +7093,8 @@ assembled = Some(a.response);
                     let msg = "guardrail service unavailable".to_string();
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let err = GatewayError::GuardrailUnavailable(msg.clone());
-                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err);
+                    let log_context = RequestLogContext::from_error(&request, stream_trace_id.clone(), duration_ms, &err)
+            .with_client_tool(client_tool.clone());
                     log_outcome(&state, &request, &log_context, _guard.active_handle(), _guard.inbound_telemetry(), _guard.prompt_meta());
                     for event in emit_sse_error_event("guardrail_unavailable", &msg, &stream_trace_id) {
                         yield Ok(event);
@@ -8587,6 +8704,7 @@ fn anthropic_guardrail_error_response(
     request_guard: &mut RequestCompleteGuard,
     trace_id: &str,
     active_handle: &crate::active_requests::ActiveRequestHandle,
+    client_tool: Option<String>,
     err: GatewayError,
 ) -> Response {
     let duration_ms = request_guard.complete();
@@ -8596,7 +8714,8 @@ fn anthropic_guardrail_error_response(
         duration_ms,
         &err,
     )
-    .with_anthropic_protocol(claude_session_id.clone());
+    .with_anthropic_protocol(claude_session_id.clone())
+.with_client_tool(client_tool);
     log_outcome(state, chat_request, &log_context, Some(active_handle), request_guard.inbound_telemetry(), None);
     tracing::warn!(
         trace_id = %trace_id,
@@ -8911,6 +9030,9 @@ async fn anthropic_create_buffered(
 ) -> Response {
     state.metrics.start_request();
     let start = std::time::Instant::now();
+    // Coding-tool attribution (Req 1.1/1.5): computed once from the
+    // ORIGINAL client headers before any guardrail or dispatch work.
+    let client_tool = Some(crate::client_tool::classify(&headers).as_str().to_string());
     let owner_id = virtual_key_id.clone().unwrap_or_else(|| ANONYMOUS_KEY_ID.to_string());
     let active_handle = state.active_requests.register(build_active_request_info(
         &trace_id,
@@ -8918,20 +9040,24 @@ async fn anthropic_create_buffered(
         Some(&owner_id),
         crate::active_requests::RequestKind::Chat,
     ));
-    let mut request_guard = RequestCompleteGuard::new(
-        state.metrics.clone(),
-        start,
-        Some((state.active_requests.clone(), trace_id.clone())),
-    )
-    .with_inbound_telemetry(inbound_telemetry.clone())
-    .with_telemetry(
-        state.telemetry_exporter.clone(),
-        state.telemetry_snapshot.clone(),
-    );
+let mut request_guard = RequestCompleteGuard::new(
+state.metrics.clone(),
+start,
+Some((state.active_requests.clone(), trace_id.clone())),
+)
+.with_abandon_logger(
+AbandonLogger::new(&state, &active_handle)
+.with_client_tool(client_tool.clone()),
+)
+.with_inbound_telemetry(inbound_telemetry.clone())
+.with_telemetry(
+state.telemetry_exporter.clone(),
+state.telemetry_snapshot.clone(),
+);
 
-    // Snapshot request-scoped engines once and release the hot-reload lock
-    // before cache lookup, guardrail evaluation, or routing (mirrors
-    // `chat_completions_non_stream`).
+// Snapshot request-scoped engines once and release the hot-reload lock
+// before cache lookup, guardrail evaluation, or routing (mirrors
+// `chat_completions_non_stream`).
     let guardrail_engine = state.guardrail_engine.read().await.clone();
 
     // Tier-1 exact cache (Req 6.5): translated /v1/messages requests share
@@ -8954,7 +9080,7 @@ duration_ms,
 &cached_chat,
 )
 .with_anthropic_protocol(claude_session_id)
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &cached_chat));
+        .with_client_tool(client_tool.clone()).with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &cached_chat));
  log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry(), None);
  request_guard.complete();
  let synthesis_ctx = AnthropicSynthesisContext {
@@ -9015,6 +9141,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -9026,6 +9153,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     GatewayError::GuardrailInvalidAction,
                 );
             }
@@ -9038,6 +9166,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -9051,6 +9180,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -9136,6 +9266,7 @@ match result {
                             &mut request_guard,
                             &trace_id,
                             &active_handle,
+                            client_tool.clone(),
                             err,
                         );
                     }
@@ -9150,6 +9281,7 @@ match result {
                             &mut request_guard,
                             &trace_id,
                             &active_handle,
+                            client_tool.clone(),
                             err,
                         );
                     }
@@ -9163,7 +9295,7 @@ match result {
                 &chat_response,
             )
             .with_anthropic_protocol(claude_session_id.clone())
-            .with_memory(
+        .with_client_tool(client_tool.clone())            .with_memory(
                 memory_context
                     .as_ref()
                     .map(|memory| (&memory.context, &memory.injection)),
@@ -9228,7 +9360,8 @@ match result {
             duration_ms,
             &err,
         )
-        .with_anthropic_protocol(claude_session_id);
+        .with_anthropic_protocol(claude_session_id)
+        .with_client_tool(client_tool.clone());
         log_outcome(&state, &chat_request, &log_context, Some(&active_handle), request_guard.inbound_telemetry(), None);
         request_guard.complete();
         let mut response = anthropic_gateway_error_response(&err);
@@ -9272,13 +9405,17 @@ async fn anthropic_create_stream(
 	memory_mode: MemoryMode,
 	inbound_telemetry: Option<crate::telemetry::propagation::W3cContext>,
 ) -> Response {
+    // Coding-tool attribution (Req 1.1/1.5): recomputed from the original
+    // headers here since the buffered path computed its own copy before
+    // delegating with stream=true.
+    let client_tool = Some(crate::client_tool::classify(&headers).as_str().to_string());
     let streaming_config = state
-        .config
-        .read()
-        .await
-        .streaming
-        .clone()
-        .unwrap_or_default();
+    .config
+    .read()
+    .await
+    .streaming
+    .clone()
+    .unwrap_or_default();
 
     state.metrics.start_request();
     let start = std::time::Instant::now();
@@ -9289,18 +9426,22 @@ async fn anthropic_create_stream(
         Some(&owner_id),
         crate::active_requests::RequestKind::Chat,
     ));
-    let mut request_guard = RequestCompleteGuard::new(
-        state.metrics.clone(),
-        start,
-        Some((state.active_requests.clone(), trace_id.clone())),
-    )
-    .with_inbound_telemetry(inbound_telemetry.clone())
-    .with_telemetry(
-        state.telemetry_exporter.clone(),
-        state.telemetry_snapshot.clone(),
-    );
+let mut request_guard = RequestCompleteGuard::new(
+state.metrics.clone(),
+start,
+Some((state.active_requests.clone(), trace_id.clone())),
+)
+.with_abandon_logger(
+AbandonLogger::new(&state, &active_handle)
+.with_client_tool(client_tool.clone()),
+)
+.with_inbound_telemetry(inbound_telemetry.clone())
+.with_telemetry(
+state.telemetry_exporter.clone(),
+state.telemetry_snapshot.clone(),
+);
 
-    // Snapshot request-scoped engine once (mirrors the chat streaming
+// Snapshot request-scoped engine once (mirrors the chat streaming
     // handler) so the hot-reload lock is never held across an await.
     let guardrail_engine = state.guardrail_engine.read().await.clone();
 
@@ -9341,6 +9482,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -9352,6 +9494,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     GatewayError::GuardrailInvalidAction,
                 );
             }
@@ -9364,6 +9507,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -9377,6 +9521,7 @@ if let Some(engine) = guardrail_engine.as_ref() {
                     &mut request_guard,
                     &trace_id,
                     &active_handle,
+                    client_tool.clone(),
                     err,
                 );
             }
@@ -9489,6 +9634,7 @@ return anthropic_guardrail_error_response(
 &mut request_guard,
 &trace_id,
 &active_handle,
+client_tool.clone(),
 err,
 );
 }
@@ -9503,6 +9649,7 @@ return anthropic_guardrail_error_response(
 &mut request_guard,
 &trace_id,
 &active_handle,
+client_tool.clone(),
 err,
 );
 }
@@ -9528,7 +9675,7 @@ duration_ms,
 &chat_response,
 )
 .with_anthropic_protocol(claude_session_id.clone())
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &chat_response))
+        .with_client_tool(client_tool.clone()).with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &chat_response))
 .with_memory(
 memory_context
 .as_ref()
@@ -9582,7 +9729,7 @@ duration_ms,
 &chat_response,
 )
 .with_anthropic_protocol(claude_session_id.clone())
-.with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &chat_response))
+        .with_client_tool(client_tool.clone()).with_completion_text(telemetry_completion_text(&state.telemetry_snapshot, &chat_response))
 .with_memory(
 memory_context
 .as_ref()
@@ -9829,7 +9976,8 @@ stream_trace_id.clone(),
 duration_ms,
 &err,
 )
-.with_anthropic_protocol(claude_session_id.clone());
+.with_anthropic_protocol(claude_session_id.clone())
+.with_client_tool(client_tool.clone());
 log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref(), None);
 } else {
 // Estimate output tokens when the provider never sent a
@@ -9868,7 +10016,7 @@ let log_context = RequestLogContext::from_streaming_success(
     compression.clone(),
 )
 .with_anthropic_protocol(claude_session_id.clone())
-.with_usage(input_tokens, output_tokens);
+        .with_client_tool(client_tool.clone()).with_usage(input_tokens, output_tokens);
 log_outcome(&state, &chat_request, &log_context, Some(&active_handle), stream_inbound_telemetry.as_ref(), None);
 }
 };
@@ -9894,7 +10042,8 @@ Err(err) => {
         duration_ms,
         &err,
     )
-    .with_anthropic_protocol(claude_session_id);
+    .with_anthropic_protocol(claude_session_id)
+    .with_client_tool(client_tool.clone());
     log_outcome(&state, &chat_request, &log_context, Some(&active_handle), inbound_telemetry.as_ref(), None);
     request_guard.complete();
     let mut response = anthropic_gateway_error_response(&err);
@@ -13009,6 +13158,7 @@ authenticated_key.as_ref().map(|Extension(key)| key),
         let memory_mode = memory_mode(&headers);
         let inbound_telemetry =
             super::telemetry_seam::extract_inbound_context(&headers, state.telemetry_snapshot.enabled());
+        let client_tool = Some(crate::client_tool::classify(&headers).as_str().to_string());
         RequestOutputCapScope::new(output_cap_applied_value)
             .with_metadata(output_cap_metadata)
             .scope(async {
@@ -13023,6 +13173,7 @@ authenticated_key.as_ref().map(|Extension(key)| key),
                 inbound_telemetry,
                 // Legacy completions bodies carry no prompt-library field.
                 None,
+                client_tool,
             )
             .await
         })

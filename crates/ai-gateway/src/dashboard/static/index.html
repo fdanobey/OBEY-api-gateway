@@ -87,6 +87,12 @@ tbody tr:hover{background:rgba(59,130,246,.06)}
 .badge-protocol-chat{background:rgba(148,163,184,.15);color:var(--text-muted)}
 .badge-protocol-memory_consolidation{background:rgba(20,184,166,.15);color:#14b8a6}
 
+/* Coding-tool badges (per-seat-coding-tool-spend-views Req 5.2) */
+.badge-tool{background:rgba(139,92,246,.15);color:#8b5cf6}
+.badge-tool-unattributed{background:rgba(148,163,184,.15);color:var(--text-muted)}
+/* Spend-by-tool drill-down rows (per-seat-coding-tool-spend-views Task 5) */
+tr.tool-drill{cursor:pointer}
+
 /* In-flight request phase badges */
 .inflight-pending{background:rgba(148,163,184,.18);color:var(--text-muted)}
 .inflight-primary{background:rgba(34,197,94,.15);color:var(--success)}
@@ -305,14 +311,36 @@ body.sec-banner-active{padding-top:3.2rem}
       <div class="chart-box"><h3>Cost by Provider</h3><canvas id="chart-cost-provider"></canvas></div>
       <div class="chart-box"><h3>Cost Trend</h3><canvas id="chart-cost-trend"></canvas></div>
     </div>
-    <div class="table-wrap">
-      <table aria-label="Cost by provider">
-        <thead><tr><th>Provider</th><th>Cost</th><th>% of Total</th></tr></thead>
-        <tbody id="cost-tbody"></tbody>
-      </table>
-    </div>
-    <div class="empty" id="cost-empty">No cost data yet</div>
-  </section>
+<div class="table-wrap">
+<table aria-label="Cost by provider">
+<thead><tr><th>Provider</th><th>Cost</th><th>% of Total</th></tr></thead>
+<tbody id="cost-tbody"></tbody>
+</table>
+</div>
+<div class="empty" id="cost-empty">No cost data yet</div>
+
+<!-- Spend by Tool (per-seat-coding-tool-spend-views Task 5) -->
+<h2 class="section-title" style="margin-top:1.5rem">Spend by Tool</h2>
+<p class="section-note" id="ct-note">Per-client-tool spend over the last 30 days. Click a tool to filter the Log Viewer.</p>
+<div class="chart-row">
+<div class="chart-box"><h3>Spend by Tool</h3><canvas id="chart-cost-tool"></canvas></div>
+<div class="chart-box"><h3>Tool × Seat Spend</h3><canvas id="chart-cost-tool-key"></canvas></div>
+</div>
+<div class="table-wrap">
+<table aria-label="Spend by tool">
+<thead><tr><th>Tool</th><th>Cost</th><th>% of Total</th><th>Requests</th><th>Active Keys</th></tr></thead>
+<tbody id="ct-tbody"></tbody>
+</table>
+</div>
+<div class="empty" id="ct-empty">No tool spend data yet</div>
+<div class="table-wrap">
+<table aria-label="Tool by seat spend">
+<thead><tr><th>Tool</th><th>Seat (Key)</th><th>Cost</th><th>Requests</th><th>Tokens (In / Out)</th></tr></thead>
+<tbody id="ct-key-tbody"></tbody>
+</table>
+</div>
+<div class="empty" id="ct-key-empty">No tool × seat spend data yet</div>
+</section>
 
   <!-- Compression Summary (Tasks 9.4, 9.5) -->
   <section class="section" id="sec-compression" role="tabpanel" aria-labelledby="tab-compression">
@@ -539,6 +567,20 @@ body.sec-banner-active{padding-top:3.2rem}
 </select>
 </div>
 <div class="fg">
+<label for="f-tool">Coding Tool</label>
+<select id="f-tool">
+<option value="">All</option>
+<option value="claude-code">claude-code</option>
+<option value="codex">codex</option>
+<option value="cursor">cursor</option>
+<option value="gemini-cli">gemini-cli</option>
+<option value="qwen-code">qwen-code</option>
+<option value="roo-code">roo-code</option>
+<option value="opencode">opencode</option>
+<option value="unattributed">unattributed</option>
+</select>
+</div>
+<div class="fg">
 <label for="f-compression-level">Compression Level</label>
         <select id="f-compression-level">
           <option value="">All</option>
@@ -558,7 +600,7 @@ body.sec-banner-active{padding-top:3.2rem}
       <table aria-label="Request logs">
         <thead>
           <tr>
-<th>Timestamp</th><th>Trace ID</th><th>Provider</th><th>Model</th><th>Protocol</th>
+<th>Timestamp</th><th>Trace ID</th><th>Provider</th><th>Model</th><th>Protocol</th><th>Tool</th>
 <th>Status</th><th>Duration</th><th>Cost</th><th>Compression</th><th>Reduction</th><th>Session</th>
           </tr>
         </thead>
@@ -580,14 +622,15 @@ body.sec-banner-active{padding-top:3.2rem}
   var tabs = document.querySelectorAll('.tab-btn');
   var sections = document.querySelectorAll('.section');
 
-  function switchSection(id) {
-    tabs.forEach(function(t){ t.setAttribute('aria-selected','false'); });
-    sections.forEach(function(s){ s.classList.remove('active'); });
-    var tab = document.querySelector('[data-section="'+id+'"]');
-    var sec = document.getElementById('sec-'+id);
-    if(tab) tab.setAttribute('aria-selected','true');
-    if(sec) sec.classList.add('active');
-  }
+function switchSection(id) {
+tabs.forEach(function(t){ t.setAttribute('aria-selected','false'); });
+sections.forEach(function(s){ s.classList.remove('active'); });
+var tab = document.querySelector('[data-section="'+id+'"]');
+var sec = document.getElementById('sec-'+id);
+if(tab) tab.setAttribute('aria-selected','true');
+if(sec) sec.classList.add('active');
+ if(id==='costs'){ loadToolSpend(); }
+}
 
   tabs.forEach(function(tab){
     tab.addEventListener('click', function(){ switchSection(this.dataset.section); });
@@ -654,7 +697,7 @@ function esc(s){ var d=document.createElement('div');d.textContent=s==null?'':St
   var MAX_COMPRESSION_CHART_POINTS = 100;
   var compressionSequence = 0;
 
-  var reqRateChart, respTimeChart, costProviderChart, costTrendChart, compressionTimelineChart, compressionLevelChart;
+  var reqRateChart, respTimeChart, costProviderChart, costTrendChart, compressionTimelineChart, compressionLevelChart, costToolChart, costToolKeyChart;
 
   function initCharts(){
     if(typeof Chart==='undefined') return;
@@ -672,9 +715,17 @@ function esc(s){ var d=document.createElement('div');d.textContent=s==null?'':St
       data:{labels:[],datasets:[{data:[],backgroundColor:['#3b82f6','#22c55e','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#f97316']}]},
       options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:chartColors.tick}}}}});
 
-    costTrendChart = new Chart($('chart-cost-trend'),{type:'line',
-      data:{labels:[],datasets:[Object.assign({},baseDataset,{data:[],borderColor:'rgba(245,158,11,.8)',backgroundColor:'rgba(245,158,11,.1)'})]},
-      options:chartOpts});
+costTrendChart = new Chart($('chart-cost-trend'),{type:'line',
+data:{labels:[],datasets:[Object.assign({},baseDataset,{data:[],borderColor:'rgba(245,158,11,.8)',backgroundColor:'rgba(245,158,11,.1)'})]},
+options:chartOpts});
+
+costToolChart = new Chart($('chart-cost-tool'),{type:'doughnut',
+data:{labels:[],datasets:[{data:[],backgroundColor:['#3b82f6','#22c55e','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#f97316','#14b8a6']}]},
+options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{color:chartColors.tick}}}}});
+
+costToolKeyChart = new Chart($('chart-cost-tool-key'),{type:'bar',
+data:{labels:[],datasets:[{data:[],backgroundColor:['#8b5cf6','#3b82f6','#22c55e','#f59e0b','#ef4444','#ec4899','#06b6d4','#f97316','#14b8a6']}]},
+options:chartOpts});
 
     compressionTimelineChart = new Chart($('chart-compression-timeline'),{type:'line',
       data:{labels:[],datasets:[Object.assign({},baseDataset,{data:[],borderColor:'rgba(34,197,94,.8)',backgroundColor:'rgba(34,197,94,.1)'})]},
@@ -1186,14 +1237,162 @@ html+='<tr><td>'+esc(displayName)+'</td>'
     });
     tbody.innerHTML=html; /* xss-audit: escaped via esc()/escHtml() in builder */
 
-    if(costProviderChart){
-      costProviderChart.data.labels=costByProvider.map(function(i){return i[0];});
-      costProviderChart.data.datasets[0].data=costByProvider.map(function(i){return i[1];});
-      costProviderChart.update('none');
-    }
-  }
+ if(costProviderChart){
+ costProviderChart.data.labels=costByProvider.map(function(i){return i[0];});
+ costProviderChart.data.datasets[0].data=costByProvider.map(function(i){return i[1];});
+ costProviderChart.update('none');
+ }
+ }
 
-  function renderErrors(errors){
+ // --- Spend by Tool (per-seat-coding-tool-spend-views Task 5) ---
+ var ctRangeStart = new Date(Date.now() - 29*86400000);
+ var ctRangeEnd = new Date(Date.now() + 86400000);
+
+ function ctToolFromDimension(dim){
+ var value = String(dim||'');
+ var idx = value.indexOf(':');
+ return idx >= 0 ? value.slice(0, idx) : value;
+ }
+
+ function drillIntoTool(tool){
+ var token = String(tool||'').trim();
+ if(!token) return;
+ var select = $('f-tool');
+ if(!select) return;
+ var known = false;
+ for(var i=0;i<select.options.length;i++){
+ if(select.options[i].value===token){ select.selectedIndex=i; known=true; break; }
+ }
+ if(!known) return;
+ switchSection('logs');
+ if(typeof select.dispatchEvent==='function') select.dispatchEvent(new Event('change'));
+ $('log-filter-form').dispatchEvent(new Event('submit'));
+ }
+
+ function ctReportParams(groupBy){
+ var params = new URLSearchParams();
+ params.set('start', ctRangeStart.toISOString());
+ params.set('end', ctRangeEnd.toISOString());
+ params.set('group_by', groupBy);
+ return params;
+ }
+
+ function ctFetchReport(groupBy){
+ return fetch(adminBasePath+'/cost-reports?'+ctReportParams(groupBy).toString())
+ .then(function(r){
+ return r.json().then(function(body){
+ if(!r.ok){ var err = new Error((body.error&&(typeof body.error==='string'?body.error:body.error.message))||('HTTP '+r.status)); err.status = r.status; throw err; }
+ return body;
+ });
+ });
+ }
+
+ function renderToolSpend(report){
+ var rows = (report&&report.rows)||[];
+ var total = 0;
+ rows.forEach(function(r){ total += Number(r.cost_usd)||0; });
+
+ var tbody = $('ct-tbody');
+ if(!rows.length || (rows.length===1 && String(rows[0].dimension||'').trim()==='unattributed')){
+ tbody.innerHTML=''; /* xss-audit: static */
+ $('ct-empty').style.display='block';
+ $('ct-empty').textContent='No coding-tool spend in the last 30 days (unattributed-only traffic counts as unattributed)';
+ } else {
+ $('ct-empty').style.display='none';
+ var html='';
+ rows.forEach(function(r){
+ var tool=String(r.dimension||'unattributed');
+ var cost=Number(r.cost_usd)||0;
+ var pct=total>0?((cost/total)*100).toFixed(1):'0.0';
+ var reqs=Number(r.requests)||0;
+ var keys=r.active_keys;
+ html+='<tr class="tool-drill" data-tool="'+esc(tool)+'" title="Show logs for '+esc(tool)+'">'
+ +'<td>'+esc(tool)+'</td><td>'+fmtCost(cost)+'</td><td>'+pct+'%</td>'
+ +'<td>'+reqs+'</td>'
+ +'<td>'+(keys!=null?String(keys):'—')+'</td></tr>';
+ });
+ tbody.innerHTML=html; /* xss-audit: escaped via esc() in builder */
+ Array.prototype.forEach.call(tbody.querySelectorAll('tr[data-tool]'),function(tr){
+ tr.addEventListener('click',function(){ drillIntoTool(this.getAttribute('data-tool')); });
+ });
+ }
+
+ if(costToolChart){
+ costToolChart.data.labels = rows.map(function(r){ return String(r.dimension||'unattributed'); });
+ costToolChart.data.datasets[0].data = rows.map(function(r){ return Number(r.cost_usd)||0; });
+ costToolChart.update('none');
+ }
+ }
+
+ function renderToolKeySpend(report){
+ var rows = (report&&report.rows)||[];
+ var tbody = $('ct-key-tbody');
+ if(!rows.length){
+ tbody.innerHTML=''; /* xss-audit: static */
+ $('ct-key-empty').style.display='block';
+ $('ct-key-empty').textContent='No coding-tool × seat spend in the last 30 days';
+ return;
+ }
+ $('ct-key-empty').style.display='none';
+ var html='';
+ rows.forEach(function(r){
+ var dim=String(r.dimension||'unattributed:unattributed');
+ var sep=dim.indexOf(':');
+ var tool=sep>=0?dim.slice(0,sep):dim;
+ var seat=sep>=0?dim.slice(sep+1):'unattributed';
+ var cost=Number(r.cost_usd)||0;
+ var reqs=Number(r.requests)||0;
+ var inTok=Number(r.input_tokens)||0;
+ var outTok=Number(r.output_tokens)||0;
+ html+='<tr class="tool-drill" data-tool="'+esc(tool)+'" title="Show logs for '+esc(tool)+'">'
+ +'<td>'+esc(tool)+'</td><td>'+esc(seat)+'</td><td>'+fmtCost(cost)+'</td>'
+ +'<td>'+reqs+'</td><td>'+fmtTokens(inTok)+' / '+fmtTokens(outTok)+'</td></tr>';
+ });
+ tbody.innerHTML=html; /* xss-audit: escaped via esc() in builder */
+ var allUnattributed = rows.every(function(r){ return ctToolFromDimension(String(r.dimension||'')).trim()==='unattributed'; });
+ if(allUnattributed){
+ $('ct-key-empty').style.display='block';
+ $('ct-key-empty').textContent='No coding-tool × seat spend in the last 30 days (unattributed-only traffic counts as unattributed)';
+ } else {
+ $('ct-key-empty').style.display='none';
+ }
+ Array.prototype.forEach.call(tbody.querySelectorAll('tr[data-tool]'),function(tr){
+ tr.addEventListener('click',function(){ drillIntoTool(this.getAttribute('data-tool')); });
+ });
+
+ var toolTotals = {};
+ rows.forEach(function(r){
+ var dim=String(r.dimension||'unattributed:unattributed');
+ var tool=ctToolFromDimension(dim);
+ toolTotals[tool] = (toolTotals[tool]||0) + (Number(r.cost_usd)||0);
+ });
+ var names = Object.keys(toolTotals);
+ names.sort(function(a,b){ return toolTotals[b]-toolTotals[a]; });
+ if(costToolKeyChart){
+ costToolKeyChart.data.labels = names;
+ costToolKeyChart.data.datasets[0].data = names.map(function(n){ return toolTotals[n]; });
+ costToolKeyChart.update('none');
+ }
+ }
+
+function loadToolSpend(){
+ ctFetchReport('client_tool')
+ .then(renderToolSpend)
+ .catch(function(err){
+ $('ct-tbody').innerHTML=''; /* xss-audit: static */
+ $('ct-empty').style.display='block';
+ $('ct-empty').textContent=(err&&(err.status===401||err.status===403))?'Admin login required to view coding-tool spend.':'Failed to load spend by tool';
+ });
+ ctFetchReport('client_tool_key')
+ .then(renderToolKeySpend)
+ .catch(function(err){
+ $('ct-key-tbody').innerHTML=''; /* xss-audit: static */
+ $('ct-key-empty').style.display='block';
+ $('ct-key-empty').textContent=(err&&(err.status===401||err.status===403))?'Admin login required to view tool × seat spend.':'Failed to load tool × seat spend';
+ });
+ }
+
+function renderErrors(errors){
     var tbody=$('errors-tbody');
     if(!errors||!errors.length){tbody.innerHTML=''; /* xss-audit: static */$('errors-empty').style.display='block';return;}
     $('errors-empty').style.display='none';
@@ -1401,6 +1600,18 @@ cell.appendChild(badge);
 row.appendChild(cell);
 }
 
+// Coding-tool badge (per-seat-coding-tool-spend-views Req 5.2): NULL
+// (legacy rows) renders as the muted 'unattributed' token.
+function appendToolBadge(row, tool){
+var cell=document.createElement('td');
+var value=String(tool||'unattributed');
+var badge=document.createElement('span');
+badge.className='badge badge-tool'+(value==='unattributed'?' badge-tool-unattributed':'');
+badge.textContent=value;
+cell.appendChild(badge);
+row.appendChild(cell);
+}
+
 function renderLogs(logs){
 var tbody=$('logs-tbody');
 clearNode(tbody);
@@ -1414,6 +1625,7 @@ appendTextCell(row,String(log.trace_id||''));
 appendTextCell(row,String(log.provider||''));
 appendTextCell(row,String(log.model||''));
 appendProtocolBadge(row,log.client_protocol);
+appendToolBadge(row,log.client_tool);
 appendTextCell(row,String(log.status_code==null?'':log.status_code));
 appendTextCell(row,fmtMs(log.duration_ms));
 appendTextCell(row,fmtCost(log.cost));
@@ -1457,8 +1669,9 @@ renderProviders(msg.data.provider_health, msg.data.budget_status_by_provider);
 renderVkBudgets(msg.data.budget_status_by_virtual_key);
 renderBudgetAlerts(msg.data.recent_budget_alerts);
 renderCircuitBreakers(msg.data.circuit_breaker_states);
-renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
-}
+ renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
+ loadToolSpend();
+ }
         if(msg.type==='errors'&&msg.data){ renderErrors(msg.data); }
         if(msg.type==='compression'&&msg.data){ handleCompressionEvent(msg.data); handleToolCompressionEvent(msg.data); }
         if((msg.type==='memory_event'||msg.type==='memory')&&msg.data){ handleMemoryEvent(msg.data); }
@@ -1494,6 +1707,7 @@ renderCosts(msg.data.cost_by_provider, msg.data.cumulative_cost);
     var status=$('f-status').value.trim(); if(status) params.set('status_code',status);
 var trace=$('f-trace').value.trim(); if(trace) params.set('trace_id',trace);
 var protocol=$('f-protocol').value; if(protocol) params.set('client_protocol',protocol);
+var tool=$('f-tool').value; if(tool) params.set('client_tool',tool);
 var compressionLevel=$('f-compression-level').value; if(compressionLevel) params.set('compression_level',compressionLevel);
 
     $('logs-empty').style.display='block';
@@ -1525,8 +1739,9 @@ renderProviders(data.provider_health, data.budget_status_by_provider);
 renderVkBudgets(data.budget_status_by_virtual_key);
 renderBudgetAlerts(data.recent_budget_alerts);
 renderCircuitBreakers(data.circuit_breaker_states);
-renderCosts(data.cost_by_provider, data.cumulative_cost);
-})
+ renderCosts(data.cost_by_provider, data.cumulative_cost);
+ loadToolSpend();
+ })
 .catch(function(){/* silent */});
 }
 

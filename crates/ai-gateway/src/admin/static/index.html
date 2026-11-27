@@ -1674,8 +1674,25 @@ body.sec-banner-active{padding-top:3.2rem}
 </div>
 </div>
 </fieldset>
-<fieldset><legend>Prompt Filter (prompt-library-versioning, Req 4.4)</legend>
-<p class="hint" style="margin-bottom:.75rem">Search request logs for prompt-resolved requests by exact prompt id and version (the dashboard logs endpoint's <code>prompt_id</code>/<code>prompt_version</code> query params). Empty fields match everything.</p>
+<fieldset><legend>Log Search (per-seat-coding-tool-spend-views, Req 5.1-5.3)</legend>
+<p class="hint" style="margin-bottom:.75rem">Search request logs by coding tool, prompt id and version (the dashboard logs endpoint's <code>client_tool</code>/<code>prompt_id</code>/<code>prompt_version</code> query params). Empty fields match everything; <code>unattributed</code> covers rows written before tool attribution.</p>
+<div class="form-row">
+<div class="form-group">
+<label for="log-tool">Coding Tool</label>
+<select id="log-tool">
+<option value="">All</option>
+<option value="claude-code">claude-code</option>
+<option value="codex">codex</option>
+<option value="cursor">cursor</option>
+<option value="gemini-cli">gemini-cli</option>
+<option value="qwen-code">qwen-code</option>
+<option value="roo-code">roo-code</option>
+<option value="opencode">opencode</option>
+<option value="unattributed">unattributed</option>
+</select>
+<div class="hint">Exact match against the request-log client_tool column</div>
+</div>
+</div>
 <div class="form-row">
 <div class="form-group">
 <label for="log-prompt-id">Prompt ID</label>
@@ -1692,7 +1709,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <div class="pl-error" id="log-prompt-error" role="alert" hidden style="margin-top:.75rem"></div>
 <div class="pl-table-wrap" id="log-prompt-results-wrap" hidden style="margin-top:.75rem">
 <table class="pl-table" id="log-prompt-results-table">
-<caption class="sr-only">Request logs for the selected prompt filter</caption>
+<caption class="sr-only">Request logs for the selected log search filters</caption>
 <thead>
 <tr>
 <th scope="col">Time</th>
@@ -1700,6 +1717,7 @@ body.sec-banner-active{padding-top:3.2rem}
 <th scope="col">Provider</th>
 <th scope="col">Model</th>
 <th scope="col">Status</th>
+<th scope="col">Tool</th>
 <th scope="col">Prompt</th>
 </tr>
 </thead>
@@ -10342,7 +10360,7 @@ logsBtn.className = 'btn btn-secondary btn-sm';
 logsBtn.textContent = 'Logs';
 logsBtn.title = 'Filter the dashboard Log Viewer by this prompt';
 logsBtn.style.marginLeft = '.25rem';
-logsBtn.addEventListener('click', function() { switchPage('logging'); document.getElementById('log-prompt-id').value = p.id || ''; document.getElementById('log-prompt-version').value = ''; plLogSearch(p.id, null); });
+logsBtn.addEventListener('click', function() { switchPage('logging'); document.getElementById('log-tool').value = ''; document.getElementById('log-prompt-id').value = p.id || ''; document.getElementById('log-prompt-version').value = ''; plLogSearch(null, p.id, null); });
 var delBtn = document.createElement('button');
 delBtn.type = 'button';
 delBtn.className = 'btn btn-danger btn-sm';
@@ -10718,14 +10736,16 @@ showError(input, err.message);
 });
 }
 
-/* Logs-view prompt/version filter (Req 4.4): queries the dashboard logs
-* endpoint's prompt_id/prompt_version params and renders rows inline. */
-function plLogSearch(promptId, promptVersion) {
+/* Logs-view tool/prompt/version filter (Req 4.4, per-seat-coding-tool-spend-views
+ * Req 5.1-5.3): queries the dashboard logs endpoint's
+ * client_tool/prompt_id/prompt_version params and renders rows inline. */
+function plLogSearch(clientTool, promptId, promptVersion) {
 var dashLink = document.getElementById('dashboard-link');
 var dashBase = dashLink ? dashLink.getAttribute('href') : '/dashboard';
 if (!dashBase) dashBase = '/dashboard';
 dashBase = dashBase.replace(/\/+$/, '');
 var params = new URLSearchParams();
+if (clientTool) params.set('client_tool', clientTool);
 if (promptId) params.set('prompt_id', promptId);
 if (promptVersion != null && promptVersion !== '') params.set('prompt_version', String(promptVersion));
 params.set('limit', '50');
@@ -10750,7 +10770,7 @@ var tbody = document.getElementById('log-prompt-results-tbody');
 tbody.innerHTML = ''; /* xss-audit: static */
 document.getElementById('log-prompt-results-wrap').hidden = logs.length === 0;
 if (!logs.length) {
-emptyEl.textContent = 'No logs match the selected prompt filter';
+emptyEl.textContent = 'No logs match the selected filters';
 emptyEl.hidden = false;
 } else {
 emptyEl.hidden = true;
@@ -10763,18 +10783,24 @@ tr.appendChild(plTd(String(log.trace_id || ''), 'pl-monospace'));
 tr.appendChild(plTd(String(log.provider || '—')));
 tr.appendChild(plTd(String(log.model || '—')));
 tr.appendChild(plTd(log.status_code != null ? String(log.status_code) : '—'));
+var toolCell = plTd('', 'pl-monospace');
+var toolBadge = document.createElement('span');
+toolBadge.className = 'pl-label-badge';
+toolBadge.textContent = log.client_tool ? String(log.client_tool) : 'unattributed';
+toolCell.appendChild(toolBadge);
+tr.appendChild(toolCell);
 var promptCell = plTd('', 'pl-monospace');
 promptCell.textContent = (log.prompt_id ? String(log.prompt_id) : '—') + (log.prompt_version != null ? ('@v' + log.prompt_version) : '');
 tr.appendChild(promptCell);
 tbody.appendChild(tr);
 });
-setStatus('Prompt log search returned ' + logs.length + ' row' + (logs.length === 1 ? '' : 's'));
+setStatus('Log search returned ' + logs.length + ' row' + (logs.length === 1 ? '' : 's'));
 })
 .catch(function(err) {
 document.getElementById('log-prompt-results-wrap').hidden = true;
 emptyEl.textContent = 'Failed to fetch logs: ' + err.message;
 emptyEl.hidden = false;
-setStatus('Prompt log search failed: ' + err.message);
+setStatus('Log search failed: ' + err.message);
 });
 }
 
@@ -10807,7 +10833,7 @@ if (cfgSave) { cfgSave.addEventListener('click', plSaveConfig); }
 var logPromptSearch = document.getElementById('log-prompt-search');
 if (logPromptSearch) { logPromptSearch.addEventListener('click', function() {
 var versionRaw = document.getElementById('log-prompt-version').value.trim();
-plLogSearch(document.getElementById('log-prompt-id').value.trim() || null, versionRaw === '' ? null : parseInt(versionRaw, 10));
+plLogSearch(document.getElementById('log-tool').value || null, document.getElementById('log-prompt-id').value.trim() || null, versionRaw === '' ? null : parseInt(versionRaw, 10));
 }); }
 })();
 

@@ -107,6 +107,7 @@ fn one_ledger_row(trace: &str) -> LogEntry {
         prompt_version: None,
         prompt_label: None,
         output_cap_metadata: None,
+        client_tool: None,
     }
 }
 

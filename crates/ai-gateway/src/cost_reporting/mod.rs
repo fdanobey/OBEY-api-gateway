@@ -32,13 +32,18 @@ pub const MAX_RANGE_DAYS: i64 = 366;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
-/// Dimension to group cost report rows by (Requirement 1).
+/// Dimension to group cost report rows by (Requirement 1). `client_tool`
+/// and `client_tool_key` (spec: per-seat-coding-tool-spend-views, design
+/// Component 3) group by the request's coding-tool attribution and by the
+/// tool × virtual-key pair respectively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupBy {
     Day,
     Provider,
     Model,
     VirtualKey,
+    ClientTool,
+    ClientToolKey,
 }
 
 impl GroupBy {
@@ -49,6 +54,8 @@ impl GroupBy {
             "provider" => Some(GroupBy::Provider),
             "model" => Some(GroupBy::Model),
             "virtual_key" => Some(GroupBy::VirtualKey),
+            "client_tool" => Some(GroupBy::ClientTool),
+            "client_tool_key" => Some(GroupBy::ClientToolKey),
             _ => None,
         }
     }
@@ -59,12 +66,14 @@ impl GroupBy {
             GroupBy::Provider => "provider",
             GroupBy::Model => "model",
             GroupBy::VirtualKey => "virtual_key",
+            GroupBy::ClientTool => "client_tool",
+            GroupBy::ClientToolKey => "client_tool_key",
         }
     }
 
     /// Allowed values, for validation error messages.
     pub fn allowed_values() -> &'static str {
-        "day, provider, model, virtual_key"
+        "day, provider, model, virtual_key, client_tool, client_tool_key"
     }
 }
 
@@ -158,6 +167,7 @@ pub struct CostReportParams {
     pub group_by: Option<String>,
     pub provider: Option<String>,
     pub key_id: Option<String>,
+    pub client_tool: Option<String>,
     pub format: Option<String>,
 }
 
@@ -182,6 +192,7 @@ pub struct ValidatedCostReportParams {
     pub group_by: GroupBy,
     pub provider: Option<String>,
     pub key_id: Option<String>,
+    pub client_tool: Option<String>,
     pub format: ReportFormat,
 }
 
@@ -256,7 +267,12 @@ impl CostReportParams {
         // empty → None so " " cannot silently narrow a report to nothing.
         let provider = normalize_filter(&self.provider);
         let key_id = normalize_filter(&self.key_id);
-        for (parameter, filter) in [("provider", &provider), ("key_id", &key_id)] {
+        let client_tool = normalize_filter(&self.client_tool);
+        for (parameter, filter) in [
+            ("provider", &provider),
+            ("key_id", &key_id),
+            ("client_tool", &client_tool),
+        ] {
             if let Some(filter) = filter.as_deref() {
                 if filter.chars().count() > MAX_FILTER_CHARS {
                     return Err(CostReportValidationError::FilterTooLong {
@@ -272,6 +288,7 @@ impl CostReportParams {
             group_by,
             provider,
             key_id,
+            client_tool,
             format,
         })
     }
@@ -343,6 +360,12 @@ pub struct ReportRow {
     /// Requests whose cost could not be computed (missing model pricing);
     /// counted in `requests` but not in `cost_usd` (Requirement 1.8).
     pub cost_unpriced_requests: i64,
+    /// Distinct non-`unattributed` virtual keys behind this row (spec:
+    /// per-seat-coding-tool-spend-views, design Component 3/D7). `Some`
+    /// only for the `client_tool`/`client_tool_key` groupings; `None`
+    /// everywhere else so serialized shapes stay byte-identical (D11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_keys: Option<i64>,
 }
 
 impl ReportRow {
@@ -358,12 +381,16 @@ impl ReportRow {
 pub struct CostReport {
     pub rows: Vec<ReportRow>,
     pub totals: ReportRow,
+    #[serde(skip)]
+    group_by: GroupBy,
 }
 
 impl CostReport {
     /// Build a report: order rows deterministically for `group_by`, then
     /// aggregate totals in integer micro-USD (single conversion at
-    /// serialization only).
+    /// serialization only). The grouping itself is kept unserialized —
+    /// the JSON shape stays rows+totals — for the CSV renderer's
+    /// grouping-gated column logic.
     pub fn new(
         group_by: GroupBy,
         mut rows: Vec<ReportRow>,
@@ -372,7 +399,15 @@ impl CostReport {
     ) -> CostReport {
         order_rows(group_by, &mut rows);
         let totals = total_row(&rows, range_start_secs, range_end_secs);
-        CostReport { rows, totals }
+        CostReport {
+            rows,
+            totals,
+            group_by,
+        }
+    }
+
+    pub fn group_by(&self) -> GroupBy {
+        self.group_by
     }
 }
 
@@ -408,6 +443,7 @@ fn total_row(rows: &[ReportRow], window_start: i64, window_end: i64) -> ReportRo
         reasoning_tokens: 0,
         cost_micro_usd: 0,
         cost_unpriced_requests: 0,
+        active_keys: None,
     };
     for row in rows {
         totals.requests = totals.requests.saturating_add(row.requests);
@@ -540,6 +576,7 @@ mod tests {
             reasoning_tokens: 0,
             cost_micro_usd,
             cost_unpriced_requests: 0,
+            active_keys: None,
         }
     }
 
@@ -676,6 +713,7 @@ mod tests {
         assert_eq!(validated.format, ReportFormat::Json);
         assert_eq!(validated.provider, None);
         assert_eq!(validated.key_id, None);
+        assert_eq!(validated.client_tool, None);
     }
 
     #[test]
@@ -685,6 +723,8 @@ mod tests {
             ("provider", GroupBy::Provider),
             ("model", GroupBy::Model),
             ("virtual_key", GroupBy::VirtualKey),
+            ("client_tool", GroupBy::ClientTool),
+            ("client_tool_key", GroupBy::ClientToolKey),
         ] {
             assert_eq!(GroupBy::parse(raw), Some(expected));
         }
@@ -696,11 +736,13 @@ mod tests {
         p.format = Some("csv".to_string());
         p.provider = Some("openai".to_string());
         p.key_id = Some("key_42".to_string());
+        p.client_tool = Some("claude-code".to_string());
         let validated = p.validate().unwrap();
         assert_eq!(validated.group_by, GroupBy::VirtualKey);
         assert_eq!(validated.format, ReportFormat::Csv);
         assert_eq!(validated.provider.as_deref(), Some("openai"));
         assert_eq!(validated.key_id.as_deref(), Some("key_42"));
+        assert_eq!(validated.client_tool.as_deref(), Some("claude-code"));
     }
 
     #[test]
@@ -736,20 +778,41 @@ mod tests {
     }
 
     #[test]
-    fn validation_accepts_filters_at_exactly_256_chars() {
+    fn validation_rejects_client_tool_filter_over_256_chars() {
         let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-        p.provider = Some("p".repeat(MAX_FILTER_CHARS));
-        p.key_id = Some("k".repeat(MAX_FILTER_CHARS));
-        let validated = p.validate().unwrap();
+        p.client_tool = Some("c".repeat(MAX_FILTER_CHARS + 1));
+        let err = p.validate().unwrap_err();
         assert_eq!(
-            validated.provider.as_deref().map(str::len),
-            Some(MAX_FILTER_CHARS)
+            err,
+            CostReportValidationError::FilterTooLong {
+                parameter: "client_tool",
+                len: MAX_FILTER_CHARS + 1,
+            }
         );
-        assert_eq!(
-            validated.key_id.as_deref().map(str::len),
-            Some(MAX_FILTER_CHARS)
-        );
+        assert_eq!(err.parameter(), "client_tool");
+        assert!(err.to_string().contains("client_tool"), "{err}");
     }
+
+#[test]
+fn validation_accepts_filters_at_exactly_256_chars() {
+    let mut p = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
+    p.provider = Some("p".repeat(MAX_FILTER_CHARS));
+    p.key_id = Some("k".repeat(MAX_FILTER_CHARS));
+    p.client_tool = Some("c".repeat(MAX_FILTER_CHARS));
+    let validated = p.validate().unwrap();
+    assert_eq!(
+        validated.provider.as_deref().map(str::len),
+        Some(MAX_FILTER_CHARS)
+    );
+    assert_eq!(
+        validated.key_id.as_deref().map(str::len),
+        Some(MAX_FILTER_CHARS)
+    );
+    assert_eq!(
+        validated.client_tool.as_deref().map(str::len),
+        Some(MAX_FILTER_CHARS)
+    );
+}
 
     #[test]
     fn validation_trims_filters_and_whitespace_only_becomes_none() {
@@ -765,11 +828,13 @@ mod tests {
 
         // Whitespace-only filters collapse to None (no filtering).
         let mut blank = params(Some("2026-01-01T00:00:00Z"), Some("2026-01-02T00:00:00Z"));
-        blank.provider = Some("   ".to_string());
+        blank.provider = Some(" ".to_string());
         blank.key_id = Some("\t \n".to_string());
+        blank.client_tool = Some(" ".to_string());
         let validated = blank.validate().unwrap();
         assert_eq!(validated.provider, None);
         assert_eq!(validated.key_id, None);
+        assert_eq!(validated.client_tool, None);
     }
 
     #[test]
@@ -887,6 +952,23 @@ mod tests {
         assert_eq!(json["rows"][0]["cost_usd"], serde_json::json!(1.234567));
         assert_eq!(json["totals"]["cost_usd"], serde_json::json!(1.234567));
         assert!(json["rows"][0]["dimension"].is_string());
+        assert!(
+            json["rows"][0].get("active_keys").is_none(),
+            "non-tool groupings keep their exact previous JSON shape"
+        );
+    }
+
+    #[test]
+    fn tool_grouping_rows_serialize_active_keys() {
+        let mut tool_row = row("claude-code", 1_234_567);
+        tool_row.active_keys = Some(7);
+        let report = CostReport::new(GroupBy::ClientTool, vec![tool_row], 0, 1);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["rows"][0]["active_keys"], serde_json::json!(7));
+        assert!(
+            json["totals"].get("active_keys").is_none(),
+            "the totals row never carries active_keys (it is a per-dimension metric)"
+        );
     }
 
     #[test]

@@ -116,6 +116,7 @@ See [Installation](Installation) for all setup options.
 - **[Persistent Memory](Persistent-Memory)** — Cross-session memory extraction and injection
 - **[Virtual Keys](Virtual-Keys)** — Multi-tenant key management
 - **[Spend Pace Forecasting](Spend-Pace-Forecasting)** — Projected end-of-window spend, exhaustion dates, and `budget.forecast.warning` alerts
+- **[Coding Tool Spend Views](Coding-Tool-Spend-Views)** — Per-coding-tool and tool × seat spend attribution, filtering, and dashboard breakdown
 - **[Guardrail Pipelines](Guardrail-Pipelines)** — Policy enforcement and PII protection
 - **[OAuth & Codex](OAuth-and-Codex)** — OpenAI OAuth and Codex backend
 - **[Admin Panel & Dashboard](Admin-Panel-and-Dashboard)** — Web UIs, API, metrics

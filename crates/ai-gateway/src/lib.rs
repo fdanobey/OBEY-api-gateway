@@ -3,6 +3,7 @@ pub mod admin;
 pub mod anthropic;
 pub mod assistants;
 pub mod cache;
+pub mod client_tool;
 pub mod codex;
 pub mod compression;
 pub mod config;

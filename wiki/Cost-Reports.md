@@ -9,7 +9,7 @@ Reports are read-only, require no configuration, and never read in-memory gauges
 ## Cost Report Endpoint
 
 ```text
-GET /admin/cost-reports?start=<RFC3339>&end=<RFC3339>&group_by=<day|provider|model|virtual_key>&provider=<name>&key_id=<id>&format=<csv|json>
+GET /admin/cost-reports?start=<RFC3339>&end=<RFC3339>&group_by=<day|provider|model|virtual_key|client_tool|client_tool_key>&provider=<name>&key_id=<id>&client_tool=<token>&format=<csv|json>
 ```
 
 Query parameters:
@@ -18,9 +18,10 @@ Query parameters:
 |-----------|----------|---------|-------------|
 | `start` | yes | — | Window start as RFC 3339, e.g. `2026-01-01T00:00:00Z` |
 | `end` | yes | — | Window end as RFC 3339; must be strictly after `start` |
-| `group_by` | no | `day` | `day`, `provider`, `model`, or `virtual_key` |
+| `group_by` | no | `day` | `day`, `provider`, `model`, `virtual_key`, `client_tool`, or `client_tool_key` |
 | `provider` | no | — | Filter to a single provider name (conjunctive with `key_id`) |
 | `key_id` | no | — | Filter to a single virtual key id (conjunctive with `provider`) |
+| `client_tool` | no | — | Filter to a single coding tool token (conjunctive with `provider`/`key_id`); see [Coding Tool Spend Views](Coding-Tool-Spend-Views) |
 | `format` | no | `json` | `json` or `csv` |
 
 Validation rules:
@@ -53,6 +54,7 @@ Every report returns ordered rows plus a `totals` row over the requested window.
 - `group_by=day` returns one row per UTC day in the range, including empty days with zero values, in calendar order.
 - `group_by=provider`, `model`, or `virtual_key` returns one row per distinct dimension value present in the range, ordered by `cost_usd` descending; ties break by dimension ascending.
 - `group_by=virtual_key` attributes requests with no virtual key to the dimension value `"unattributed"`. The sum of `cost_usd` across all virtual-key rows equals the total `cost_usd` of the same range grouped by day (within 2-decimal rounding tolerance).
+- `group_by=client_tool` and `group_by=client_tool_key` group by the request's coding-tool attribution (`client_tool` for per-tool, `client_tool_key` for per-tool × seat). Tool rows carry an `active_keys` field (distinct non-`unattributed` virtual-key count) emitted only for these two groupings. See [Coding Tool Spend Views](Coding-Tool-Spend-Views) for the tool vocabulary, attribution rules, and dashboard breakdown.
 
 ### JSON Example
 

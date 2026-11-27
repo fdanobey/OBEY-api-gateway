@@ -270,9 +270,13 @@ compression_level: Option<String>,
 /// Exact-match prompt-library id filter (prompt-library-versioning
 /// spec, Req 4.4).
 prompt_id: Option<String>,
-/// Exact-match prompt-library version filter (Req 4.4).
-prompt_version: Option<i64>,
-limit: Option<usize>,
+    /// Exact-match prompt-library version filter (Req 4.4).
+    prompt_version: Option<i64>,
+    /// Exact-match coding-tool attribution filter
+    /// (per-seat-coding-tool-spend-views spec, Req 5.1); `unattributed`
+    /// matches NULL/blank rows.
+    client_tool: Option<String>,
+    limit: Option<usize>,
 }
 
 
@@ -528,6 +532,12 @@ async fn logs_handler(
         claude_session_id: None,
         prompt_id: params.prompt_id,
         prompt_version: params.prompt_version,
+        client_tool: params
+            .client_tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         limit: params.limit,
     };
 
@@ -1867,14 +1877,15 @@ mod tests {
                     error_class: None,
                     context_reduction: None,
                     client_protocol: None,
-                    claude_session_id: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    virtual_key_id: None,
+            claude_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            virtual_key_id: None,
             prompt_id: None,
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         })
         .unwrap();
     }
@@ -1946,6 +1957,7 @@ mod tests {
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         })
         .unwrap();
 
@@ -2011,6 +2023,7 @@ mod tests {
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         }
     }
 

@@ -399,6 +399,8 @@ curl http://localhost:8080/dashboard/rate-history                 # trailing-60s
 
 These controls are also exposed in the embedded admin panel and the dashboard provider table.
 
+Cost reports are read from the same durable spend data via `GET /admin/cost-reports`: `group_by` accepts `day`, `provider`, `model`, `virtual_key`, `client_tool`, and `client_tool_key`, with `provider`, `key_id`, and `client_tool` as optional conjunctive filters and `format` = `json` or `csv`. The `client_tool` and `client_tool_key` groupings attribute spend by coding tool (Claude Code, Codex, Cursor, ...) from the User-Agent header and add an `active_keys` row field (count of distinct virtual keys), emitted only for those two groupings. Tool attribution is persisted by the chat, completions, and anthropic front doors; the `/v1/responses` family writes no ledger rows, so its traffic does not appear in ledger-based tool views. Full parameter, validation, and CSV details are in the root README's Cost Reports section.
+
 ## Building for Release
 
 ```bash

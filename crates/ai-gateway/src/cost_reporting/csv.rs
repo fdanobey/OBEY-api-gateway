@@ -15,9 +15,10 @@
 //! integers and stay untouched (a leading `-` there is a benign negative
 //! number, and the 6-decimal cost contract must not gain a prefix).
 
-use crate::cost_reporting::{CostReport, ReportRow};
+use crate::cost_reporting::{CostReport, GroupBy, ReportRow};
 
 const CSV_HEADER: &str = "dimension,requests,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,reasoning_tokens,cost_usd,cost_unpriced_requests";
+const CSV_TOOL_HEADER: &str = "dimension,requests,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,reasoning_tokens,cost_usd,cost_unpriced_requests,active_keys";
 
 /// Characters that make spreadsheet applications interpret a cell as a
 /// formula when they lead the value.
@@ -45,9 +46,11 @@ fn escape_field(field: &str) -> String {
     }
 }
 
-/// Render one report row as a CSV line (without the trailing CRLF).
-fn render_row(row: &ReportRow) -> String {
-    [
+/// Render one report row as a CSV line (without the trailing CRLF). The
+/// trailing `active_keys` cell is appended only for the tool groupings
+/// (design D11): every other grouping's rows stay byte-identical.
+fn render_row(row: &ReportRow, include_active_keys: bool) -> String {
+    let mut fields = [
         escape_field(&row.dimension),
         row.requests.to_string(),
         row.input_tokens.to_string(),
@@ -58,18 +61,34 @@ fn render_row(row: &ReportRow) -> String {
         row.cost_usd_string(),
         row.cost_unpriced_requests.to_string(),
     ]
-    .join(",")
+    .join(",");
+    if include_active_keys {
+        fields.push(',');
+        fields.push_str(&row.active_keys.unwrap_or(0).to_string());
+    }
+    fields
 }
 
 /// Render a cost report as CSV: a constant header row followed by one row
 /// per result row. CRLF line endings throughout; the output always ends
-/// with a CRLF. An empty report yields the header row only.
+/// with a CRLF. An empty report yields the header row only. The
+/// `active_keys` column exists only for `client_tool`/`client_tool_key`
+/// reports; all pre-existing groupings keep their exact previous output.
 pub fn render_report_csv(report: &CostReport) -> String {
-    let mut out = String::with_capacity(CSV_HEADER.len() + 3 + report.rows.len() * 96);
-    out.push_str(CSV_HEADER);
+    let include_active_keys = matches!(
+        report.group_by(),
+        GroupBy::ClientTool | GroupBy::ClientToolKey
+    );
+    let header = if include_active_keys {
+        CSV_TOOL_HEADER
+    } else {
+        CSV_HEADER
+    };
+    let mut out = String::with_capacity(header.len() + 3 + report.rows.len() * 96);
+    out.push_str(header);
     out.push_str("\r\n");
     for row in &report.rows {
-        out.push_str(&render_row(row));
+        out.push_str(&render_row(row, include_active_keys));
         out.push_str("\r\n");
     }
     out
@@ -91,10 +110,11 @@ mod tests {
             cache_read_tokens: 100,
             cache_creation_tokens: 40,
             reasoning_tokens: 700,
-        cost_micro_usd,
-        cost_unpriced_requests: 2,
+            cost_micro_usd,
+            cost_unpriced_requests: 2,
+            active_keys: None,
+        }
     }
-}
 
     fn report(rows: Vec<ReportRow>) -> CostReport {
         CostReport::new(GroupBy::Provider, rows, 0, 86_400)
@@ -225,15 +245,52 @@ fn safe_values_render_without_formula_guard() {
     }
 }
 
-#[test]
-fn negative_cost_keeps_six_decimals_and_no_formula_prefix() {
-    // The `-` guard applies to the dimension field only: a negative cost
-    // renders as a plain negative number with exactly 6 decimals —
-    // `-1.500000` — and must NOT gain a `'` prefix or lose precision.
-    let rows = vec![row("d", -1_500_000)];
-    let rep = CostReport::new(GroupBy::Provider, rows, 0, 86_400);
-    let csv = render_report_csv(&rep);
-    assert!(csv.contains(",-1.500000,"), "cost column stays exact: {csv:?}");
-    assert!(!csv.contains("'-"), "numeric fields never get the formula prefix: {csv:?}");
-}
+    #[test]
+    fn negative_cost_keeps_six_decimals_and_no_formula_prefix() {
+        // The `-` guard applies to the dimension field only: a negative cost
+        // renders as a plain negative number with exactly 6 decimals —
+        // `-1.500000` — and must NOT gain a `'` prefix or lose precision.
+        let rows = vec![row("d", -1_500_000)];
+        let rep = CostReport::new(GroupBy::Provider, rows, 0, 86_400);
+        let csv = render_report_csv(&rep);
+        assert!(csv.contains(",-1.500000,"), "cost column stays exact: {csv:?}");
+        assert!(!csv.contains("'-"), "numeric fields never get the formula prefix: {csv:?}");
+    }
+
+    #[test]
+    fn tool_grouping_renders_active_keys_column() {
+        let mut tool_row = row("claude-code", 1_234_567);
+        tool_row.active_keys = Some(4);
+        let rep = CostReport::new(GroupBy::ClientTool, vec![tool_row], 0, 86_400);
+        let csv = render_report_csv(&rep);
+        assert_eq!(
+            csv.split("\r\n").next().unwrap(),
+            CSV_TOOL_HEADER,
+            "tool CSV gains the trailing active_keys column"
+        );
+        assert!(csv.contains("claude-code,3,1500,2500,100,40,700,1.234567,2,4"), "{csv:?}");
+    }
+
+    #[test]
+    fn tool_grouping_renders_zero_active_keys_when_unset() {
+        let rep = CostReport::new(GroupBy::ClientToolKey, vec![row("codex:key-9", 500)], 0, 86_400);
+        let csv = render_report_csv(&rep);
+        assert!(csv.contains("codex:key-9,3,1500,2500,100,40,700,0.000500,2,0"), "{csv:?}");
+    }
+
+    #[test]
+    fn non_tool_groupings_stay_byte_identical_without_active_keys() {
+        for group_by in [GroupBy::Day, GroupBy::Provider, GroupBy::Model, GroupBy::VirtualKey] {
+            let mut zero_row = row("d", 1_234_567);
+            zero_row.active_keys = Some(9);
+            let rep = CostReport::new(group_by, vec![zero_row], 0, 86_400);
+            let csv = render_report_csv(&rep);
+            assert!(
+                !csv.contains("active_keys"),
+                "{group_by:?} CSV must keep the legacy header: {csv:?}"
+            );
+            assert_eq!(csv.split("\r\n").next().unwrap(), CSV_HEADER);
+            assert!(csv.contains("1.234567,2\r\n"), "{csv:?}");
+        }
+    }
 }

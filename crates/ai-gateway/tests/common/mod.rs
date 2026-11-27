@@ -181,6 +181,8 @@ pub fn budget_test_config(
 // --- Cost-reporting shared fixtures (spec: billing-grade-cost-reporting) ---
 
 use ai_gateway::logger::LogEntry;
+use ai_gateway::logger::{LogFilter, RequestLogger};
+use ai_gateway::cost_reporting::ReportRow;
 use chrono::{DateTime, SecondsFormat};
 
 /// 2026-01-01T00:00:00Z in epoch seconds — the fixed anchor date every
@@ -273,6 +275,7 @@ pub fn sample_log_entry(
             prompt_version: None,
             prompt_label: None,
             output_cap_metadata: None,
+            client_tool: None,
         }
     }
 
@@ -299,17 +302,64 @@ pub const LEGACY_REQUESTS_DDL: &str = "CREATE TABLE requests (
 /// Even older `requests` DDL without the body/model-version columns —
 /// used where only the billable core matters (key-filter probing).
 pub const LEGACY_REQUESTS_MINIMAL_DDL: &str = "CREATE TABLE requests (
- id INTEGER PRIMARY KEY,
- trace_id TEXT NOT NULL,
- timestamp INTEGER NOT NULL,
- method TEXT NOT NULL,
- path TEXT NOT NULL,
- model TEXT NOT NULL,
- provider TEXT NOT NULL,
- status_code INTEGER NOT NULL,
- duration_ms INTEGER NOT NULL,
- cost REAL NOT NULL
+id INTEGER PRIMARY KEY,
+trace_id TEXT NOT NULL,
+timestamp INTEGER NOT NULL,
+method TEXT NOT NULL,
+path TEXT NOT NULL,
+model TEXT NOT NULL,
+provider TEXT NOT NULL,
+status_code INTEGER NOT NULL,
+duration_ms INTEGER NOT NULL,
+cost REAL NOT NULL
 );";
+
+/// Isolated logs.db ledger fixture: the real `RequestLogger` write path
+/// plus the temp dir holding the database. Field order matters:
+/// `_logger` (declared first) drops before `_dir`, so the writer
+/// thread's SQLite handle is closed before the TempDir cleanup deletes
+/// the database file (Windows delete-failure guard).
+pub struct LedgerFixture {
+    pub _logger: RequestLogger,
+    pub _dir: tempfile::TempDir,
+    pub db_path: String,
+}
+
+pub fn create_ledger() -> LedgerFixture {
+    let dir = tempfile::tempdir().expect("temp dir for isolated logs.db");
+    let db_path = dir.path().join("logs.db").to_string_lossy().into_owned();
+    let logger = RequestLogger::new(cost_reports_logging_config(db_path.clone()))
+        .expect("create isolated request logger");
+    LedgerFixture {
+        _logger: logger,
+        _dir: dir,
+        db_path,
+    }
+}
+
+/// Total integer micro-USD across report rows (sum-equality invariant).
+pub fn total_cost_micro(rows: &[ReportRow]) -> i64 {
+    rows.iter().map(|row| row.cost_micro_usd).sum()
+}
+
+/// Poll the request log until `done` holds or 5 s pass. A query failure
+/// panics with context: a transient missing-table/row during database
+/// creation resolves on the next poll, while a persistent error must
+/// surface instead of silently looping.
+pub async fn poll_logs(server: &GatewayServer, done: impl Fn(&[LogEntry]) -> bool) -> Vec<LogEntry> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let rows = server.state.logger.query(LogFilter::default()).unwrap_or_else(|error| {
+            panic!("log query failed while polling: {error}")
+        });
+        if done(&rows) || tokio::time::Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+// --- Shared webhook-alert test rig (webhooks_provider_alerts.rs +
 
 // --- Shared webhook-alert test rig (webhooks_provider_alerts.rs +
 // webhooks_forecast_alerts.rs; both compile into the `suite` binary) ---

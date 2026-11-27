@@ -138,6 +138,7 @@ async fn get_status_rows_reflect_operator_override_with_model_group_refs() {
         prompt_version: None,
         prompt_label: None,
         output_cap_metadata: None,
+        client_tool: None,
     };
     server.state.logger.log(entry("md-admin-1")).unwrap();
     server.state.logger.log(entry("md-admin-2")).unwrap();

@@ -374,6 +374,7 @@ pub(crate) struct LedgerColumns {
     reasoning_tokens: bool,
     key_id: bool,
     virtual_key: bool,
+    client_tool: bool,
 }
 
 impl LedgerColumns {
@@ -391,6 +392,7 @@ impl LedgerColumns {
             reasoning_tokens: has("reasoning_tokens"),
             key_id: has("key_id"),
             virtual_key: has("virtual_key"),
+            client_tool: has("client_tool"),
         })
     }
 
@@ -414,6 +416,45 @@ impl LedgerColumns {
                 "COALESCE(NULLIF(TRIM(CAST({column} AS TEXT)), ''), '{UNATTRIBUTED}')"
             ),
             None => format!("'{UNATTRIBUTED}'"),
+        }
+    }
+
+    /// SQL expression for the client-tool dimension value (spec:
+    /// per-seat-coding-tool-spend-views, design Component 3): the real
+    /// column with NULL/empty collapsing to `unattributed` when present,
+    /// the literal `unattributed` when the ledger predates the column —
+    /// the same normalization shape as [`Self::key_dimension_expr`].
+fn tool_dimension_expr(&self) -> String {
+    if self.client_tool {
+        format!(
+            "COALESCE(NULLIF(TRIM(CAST(client_tool AS TEXT)), ''), '{UNATTRIBUTED}')"
+        )
+    } else {
+        format!("'{UNATTRIBUTED}'")
+    }
+}
+
+    /// SQL expression for the composite tool × seat dimension
+    /// (`tool || ':' || key`, design D11/D6): both parts normalized, so
+    /// every composite row reads `tool:key` with the `unattributed`
+    /// fallback on either side.
+    fn tool_key_dimension_expr(&self) -> String {
+        format!("{} || ':' || {}", self.tool_dimension_expr(), self.key_dimension_expr())
+    }
+
+    /// Distinct-seat metric for the tool groupings (design Component 3,
+    /// D7): counts distinct non-`unattributed` key dimension values;
+    /// literal 0 when the ledger has no key column at all.
+    fn active_keys_expr(&self) -> String {
+        if self.key_column().is_some() {
+            format!(
+                "COUNT(DISTINCT CASE WHEN {} != '{}' THEN {} END)",
+                self.key_dimension_expr(),
+                UNATTRIBUTED,
+                self.key_dimension_expr()
+            )
+        } else {
+            "0".to_string()
         }
     }
 
@@ -578,6 +619,7 @@ fn where_clause(
     range: ValidatedRange,
     provider: Option<&str>,
     key_id: Option<&str>,
+    client_tool: Option<&str>,
 ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut clause = String::from(
         " WHERE timestamp >= ?1 AND timestamp < ?2 AND path NOT LIKE '%#attempt'",
@@ -595,24 +637,42 @@ fn where_clause(
 // filtering for `unattributed` also matches NULL/blank rows; with no
 // key column every row groups as `unattributed` by definition, so the
 // filter matches only when it asks for that literal bucket.
-if let Some(key_id) = key_id {
-    match columns.key_column() {
-        Some(column) => {
-            clause.push_str(&format!(
-                " AND COALESCE(NULLIF(TRIM(CAST({column} AS TEXT)), ''), '{UNATTRIBUTED}') = ?"
-            ));
-            params.push(Box::new(key_id.to_string()));
-        }
-        None => {
-            if key_id == UNATTRIBUTED {
-                // No key column: all rows are unattributed; the filter
-                // keeps them (narrows nothing).
-            } else {
-                clause.push_str(" AND 1 = 0");
+    if let Some(key_id) = key_id {
+        match columns.key_column() {
+            Some(column) => {
+                clause.push_str(&format!(
+                    " AND COALESCE(NULLIF(TRIM(CAST({column} AS TEXT)), ''), '{UNATTRIBUTED}') = ?"
+                ));
+                params.push(Box::new(key_id.to_string()));
+            }
+            None => {
+                if key_id == UNATTRIBUTED {
+                    // No key column: all rows are unattributed; the filter
+                    // keeps them (narrows nothing).
+                } else {
+                    clause.push_str(" AND 1 = 0");
+                }
             }
         }
     }
-}
+
+    // Tool filter binds through the SAME NULL/empty → `unattributed`
+    // normalization the grouping uses (design Component 3); with no
+    // client_tool column every row reads `unattributed`, so the filter
+    // matches only that literal bucket and nothing else.
+    if let Some(client_tool) = client_tool {
+        if columns.client_tool {
+            clause.push_str(&format!(
+                " AND COALESCE(NULLIF(TRIM(CAST(client_tool AS TEXT)), ''), '{UNATTRIBUTED}') = ?"
+            ));
+            params.push(Box::new(client_tool.to_string()));
+        } else if client_tool == UNATTRIBUTED {
+            // No tool column: every row reads `unattributed`; the filter
+            // keeps them (narrows nothing).
+        } else {
+            clause.push_str(" AND 1 = 0");
+        }
+    }
 
     (clause, params)
 }
@@ -637,6 +697,7 @@ pub fn fetch_report(
         params.range,
         params.provider.as_deref(),
         params.key_id.as_deref(),
+        params.client_tool.as_deref(),
     );
     let param_refs: Vec<&dyn rusqlite::ToSql> =
         bind_values.iter().map(|value| value.as_ref()).collect();
@@ -652,6 +713,18 @@ pub fn fetch_report(
         GroupBy::Provider => "provider".to_string(),
         GroupBy::Model => "model".to_string(),
         GroupBy::VirtualKey => columns.key_dimension_expr(),
+        GroupBy::ClientTool => columns.tool_dimension_expr(),
+        GroupBy::ClientToolKey => columns.tool_key_dimension_expr(),
+    };
+
+    // `active_keys` is selected (and surfaced) only for the tool
+    // groupings (design D11): every other grouping's SQL shape — and
+    // therefore its serialized output — stays exactly as it was.
+    let tool_grouping = matches!(params.group_by, GroupBy::ClientTool | GroupBy::ClientToolKey);
+    let active_keys_select = if tool_grouping {
+        columns.active_keys_expr()
+    } else {
+        "0".to_string()
     };
 
     // Cast the day dimension to TEXT so the row mapper's String read works
@@ -664,26 +737,28 @@ pub fn fetch_report(
 
     let sql = format!(
         "SELECT {dimension_select} AS dimension, \
-COUNT(*) AS requests, \
-{input_sum} AS input_tokens, \
-{output_sum} AS output_tokens, \
-{cache_read_sum} AS cache_read_tokens, \
-{cache_creation_sum} AS cache_creation_tokens, \
-{reasoning_sum} AS reasoning_tokens, \
-SUM(CAST(ROUND(cost * 1000000) AS INTEGER)) AS cost_micro_usd, \
-{unpriced_requests} AS cost_unpriced_requests \
-FROM requests{where_sql} \
-GROUP BY dimension",
+        COUNT(*) AS requests, \
+        {input_sum} AS input_tokens, \
+        {output_sum} AS output_tokens, \
+        {cache_read_sum} AS cache_read_tokens, \
+        {cache_creation_sum} AS cache_creation_tokens, \
+        {reasoning_sum} AS reasoning_tokens, \
+        SUM(CAST(ROUND(cost * 1000000) AS INTEGER)) AS cost_micro_usd, \
+        {unpriced_requests} AS cost_unpriced_requests, \
+        {active_keys} AS active_keys \
+        FROM requests{where_sql} \
+        GROUP BY dimension",
         input_sum = columns.token_sum(columns.input_tokens, "input_tokens"),
         output_sum = columns.token_sum(columns.output_tokens, "output_tokens"),
         cache_read_sum = columns.token_sum(columns.cache_read_tokens, "cache_read_tokens"),
         cache_creation_sum = columns.token_sum(columns.cache_creation_tokens, "cache_creation_tokens"),
         reasoning_sum = columns.token_sum(columns.reasoning_tokens, "reasoning_tokens"),
         unpriced_requests = columns.unpriced_count_expr(),
+        active_keys = active_keys_select,
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let aggregated: Vec<(String, i64, i64, i64, i64, i64, i64, i64, i64)> = stmt
+    let aggregated: Vec<(String, i64, i64, i64, i64, i64, i64, i64, i64, i64)> = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok((
                 row.get(0)?,
@@ -695,13 +770,14 @@ GROUP BY dimension",
                 row.get(6)?,
                 row.get(7)?,
                 row.get(8)?,
+                row.get(9)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut rows: Vec<ReportRow> = aggregated
         .into_iter()
-        .map(|(dimension, requests, input_tokens, output_tokens, cache_read, cache_creation, reasoning, cost_micro_usd, unpriced)| {
+        .map(|(dimension, requests, input_tokens, output_tokens, cache_read, cache_creation, reasoning, cost_micro_usd, unpriced, active_keys)| {
             let (window_start, window_end) = match params.group_by {
                 GroupBy::Day => day_bounds
                     .get(&dimension)
@@ -719,11 +795,12 @@ GROUP BY dimension",
                 cache_read_tokens: cache_read,
                 cache_creation_tokens: cache_creation,
                 reasoning_tokens: reasoning,
-            cost_micro_usd,
-            cost_unpriced_requests: unpriced,
-        }
-    })
-    .collect();
+                cost_micro_usd,
+                cost_unpriced_requests: unpriced,
+                active_keys: if tool_grouping { Some(active_keys) } else { None },
+            }
+        })
+        .collect();
 
     if params.group_by == GroupBy::Day {
         merge_day_spine(&mut rows, day_spine, &day_bounds, params.range);
@@ -844,8 +921,250 @@ fn merge_day_spine(
                 reasoning_tokens: 0,
                 cost_micro_usd: 0,
                 cost_unpriced_requests: 0,
+                active_keys: None,
             });
     }
 
     *rows = by_day.into_values().collect();
+}
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+fn memory_ledger(client_tool: bool, key_id: bool) -> Connection {
+let conn = Connection::open_in_memory().expect("memory ledger");
+conn.execute_batch(
+"CREATE TABLE requests (
+id INTEGER PRIMARY KEY,
+trace_id TEXT NOT NULL,
+timestamp INTEGER NOT NULL,
+method TEXT NOT NULL,
+path TEXT NOT NULL,
+model TEXT NOT NULL,
+provider TEXT NOT NULL,
+status_code INTEGER NOT NULL,
+duration_ms INTEGER NOT NULL,
+cost REAL NOT NULL
+);",
+)
+.expect("base requests table");
+if key_id {
+conn.execute("ALTER TABLE requests ADD COLUMN key_id TEXT", []).expect("key_id column");
+}
+if client_tool {
+conn.execute("ALTER TABLE requests ADD COLUMN client_tool TEXT", []).expect("client_tool column");
+}
+conn
+}
+
+    fn seed(
+        conn: &Connection,
+        timestamp: i64,
+        key_id: Option<&str>,
+        client_tool: Option<&str>,
+        cost: f64,
+    ) {
+        let columns = LedgerColumns::probe(conn).expect("probe ledger columns");
+        let mut column_names = vec![
+            "trace_id",
+            "timestamp",
+            "method",
+            "path",
+            "model",
+            "provider",
+            "status_code",
+            "duration_ms",
+            "cost",
+        ];
+        let mut placeholders: Vec<String> = vec![
+            "?1".to_string(),
+            "?2".to_string(),
+            "'POST'".to_string(),
+            "'/v1/chat/completions'".to_string(),
+            "'m'".to_string(),
+            "'p'".to_string(),
+            "200".to_string(),
+            "1".to_string(),
+            "?3".to_string(),
+        ];
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(format!("t-{timestamp}")), Box::new(timestamp), Box::new(cost)];
+        let mut next = 4;
+        if columns.key_id {
+            column_names.push("key_id");
+            placeholders.push(format!("?{next}"));
+            next += 1;
+            values.push(Box::new(key_id.map(str::to_string)));
+        }
+        if columns.client_tool {
+            column_names.push("client_tool");
+            placeholders.push(format!("?{next}"));
+            values.push(Box::new(client_tool.map(str::to_string)));
+        }
+        let sql = format!(
+            "INSERT INTO requests ({}) VALUES ({})",
+            column_names.join(", "),
+            placeholders.join(", ")
+        );
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|value| value.as_ref()).collect();
+        conn.execute(&sql, param_refs.as_slice()).expect("seed row");
+    }
+
+fn params(group_by: GroupBy) -> ValidatedCostReportParams {
+ValidatedCostReportParams {
+range: ValidatedRange { start_secs: 0, end_secs: 86_400 },
+group_by,
+provider: None,
+key_id: None,
+client_tool: None,
+format: crate::cost_reporting::ReportFormat::Json,
+}
+}
+
+fn tool_rows(conn: &Connection, group_by: GroupBy, client_tool: Option<&str>) -> Vec<ReportRow> {
+let mut p = params(group_by);
+p.client_tool = client_tool.map(str::to_string);
+fetch_report(conn, &p).expect("tool report")
+}
+
+#[test]
+fn tool_groupings_sum_equal_to_day_grouping() {
+let conn = memory_ledger(true, true);
+seed(&conn, 1, Some("key-a"), Some("claude-code"), 0.001);
+seed(&conn, 2, Some("key-b"), Some("codex"), 0.002);
+seed(&conn, 3, None, None, 0.003);
+seed(&conn, 4, Some("key-a"), None, 0.004);
+
+let day: i64 = tool_rows(&conn, GroupBy::Day, None).iter().map(|r| r.cost_micro_usd).sum();
+let tool: i64 = tool_rows(&conn, GroupBy::ClientTool, None).iter().map(|r| r.cost_micro_usd).sum();
+let composite: i64 = tool_rows(&conn, GroupBy::ClientToolKey, None).iter().map(|r| r.cost_micro_usd).sum();
+assert_eq!(tool, day);
+assert_eq!(composite, day);
+}
+
+#[test]
+fn tool_grouping_dimensions_and_active_keys() {
+let conn = memory_ledger(true, true);
+seed(&conn, 1, Some("key-a"), Some("claude-code"), 0.001);
+seed(&conn, 2, Some("key-a"), Some("claude-code"), 0.001);
+seed(&conn, 3, Some("key-b"), Some("claude-code"), 0.001);
+seed(&conn, 4, None, None, 0.003);
+seed(&conn, 5, Some("key-b"), None, 0.002);
+
+let rows = tool_rows(&conn, GroupBy::ClientTool, None);
+let claude = rows.iter().find(|r| r.dimension == "claude-code").expect("claude-code row");
+assert_eq!(claude.requests, 3);
+assert_eq!(claude.active_keys, Some(2));
+let unattr = rows.iter().find(|r| r.dimension == "unattributed").expect("unattributed row");
+assert_eq!(unattr.requests, 2);
+assert_eq!(unattr.active_keys, Some(1));
+}
+
+#[test]
+fn composite_dimension_pairs_tool_and_key() {
+let conn = memory_ledger(true, true);
+seed(&conn, 1, Some("key-a"), Some("claude-code"), 0.001);
+seed(&conn, 2, None, Some("codex"), 0.002);
+seed(&conn, 3, Some("key-b"), None, 0.003);
+
+let rows = tool_rows(&conn, GroupBy::ClientToolKey, None);
+let dims: Vec<&str> = rows.iter().map(|r| r.dimension.as_str()).collect();
+assert!(dims.contains(&"claude-code:key-a"), "{dims:?}");
+assert!(dims.contains(&"codex:unattributed"), "{dims:?}");
+assert!(dims.contains(&"unattributed:key-b"), "{dims:?}");
+}
+
+#[test]
+fn legacy_connection_reads_unattributed_and_zero_active_keys() {
+let conn = memory_ledger(false, true);
+seed(&conn, 1, Some("key-a"), None, 0.001);
+seed(&conn, 2, None, None, 0.002);
+
+let rows = tool_rows(&conn, GroupBy::ClientTool, None);
+assert_eq!(rows.len(), 1);
+assert_eq!(rows[0].dimension, "unattributed");
+assert_eq!(rows[0].requests, 2);
+assert_eq!(rows[0].active_keys, Some(1));
+
+let composite = tool_rows(&conn, GroupBy::ClientToolKey, None);
+assert_eq!(composite.len(), 2);
+let dims: Vec<&str> = composite.iter().map(|r| r.dimension.as_str()).collect();
+assert!(dims.contains(&"unattributed:key-a"), "{dims:?}");
+assert!(dims.contains(&"unattributed:unattributed"), "{dims:?}");
+}
+
+#[test]
+fn legacy_connection_without_key_column_reads_zero_active_keys() {
+let conn = memory_ledger(false, false);
+seed(&conn, 1, None, None, 0.001);
+
+let rows = tool_rows(&conn, GroupBy::ClientTool, None);
+assert_eq!(rows.len(), 1);
+assert_eq!(rows[0].dimension, "unattributed");
+assert_eq!(rows[0].active_keys, Some(0));
+}
+
+#[test]
+fn report_tool_filter_matches_token_and_unattributed_bucket() {
+let conn = memory_ledger(true, true);
+seed(&conn, 1, Some("key-a"), Some("claude-code"), 0.001);
+seed(&conn, 2, Some("key-b"), Some("codex"), 0.002);
+seed(&conn, 3, None, None, 0.003);
+
+let claude = tool_rows(&conn, GroupBy::ClientTool, Some("claude-code"));
+assert_eq!(claude.len(), 1);
+assert_eq!(claude[0].dimension, "claude-code");
+assert_eq!(claude[0].requests, 1);
+
+let unattr = tool_rows(&conn, GroupBy::ClientTool, Some("unattributed"));
+assert_eq!(unattr.len(), 1);
+assert_eq!(unattr[0].requests, 1);
+
+assert!(tool_rows(&conn, GroupBy::ClientTool, Some("cursor")).is_empty());
+}
+
+#[test]
+fn tool_filter_on_legacy_connection_matches_only_unattributed() {
+let conn = memory_ledger(false, true);
+seed(&conn, 1, Some("key-a"), None, 0.001);
+seed(&conn, 2, None, None, 0.002);
+
+let unattr = tool_rows(&conn, GroupBy::ClientTool, Some("unattributed"));
+assert_eq!(unattr.len(), 1);
+assert_eq!(unattr[0].requests, 2);
+assert!(tool_rows(&conn, GroupBy::ClientTool, Some("codex")).is_empty());
+}
+
+#[test]
+fn non_tool_groupings_do_not_surface_active_keys() {
+let conn = memory_ledger(true, true);
+seed(&conn, 1, Some("key-a"), Some("claude-code"), 0.001);
+
+for group_by in [GroupBy::Day, GroupBy::Provider, GroupBy::Model, GroupBy::VirtualKey] {
+let rows = tool_rows(&conn, group_by, None);
+assert!(
+rows.iter().all(|r| r.active_keys.is_none()),
+"{group_by:?} rows must not carry active_keys"
+);
+}
+}
+
+#[test]
+fn blank_tool_values_collapse_into_unattributed() {
+let conn = memory_ledger(true, true);
+seed(&conn, 1, Some("key-a"), Some(""), 0.001);
+seed(&conn, 2, None, Some(" "), 0.002);
+conn.execute(
+"INSERT INTO requests (trace_id, timestamp, method, path, model, provider, status_code, duration_ms, cost, key_id, client_tool) VALUES ('t-null', 3, 'POST', '/v1/chat/completions', 'm', 'p', 200, 1, 0.003, NULL, NULL)",
+[],
+)
+.expect("seed null row");
+
+let rows = tool_rows(&conn, GroupBy::ClientTool, None);
+assert_eq!(rows.len(), 1);
+assert_eq!(rows[0].dimension, "unattributed");
+assert_eq!(rows[0].requests, 3);
+}
 }
